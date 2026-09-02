@@ -1,0 +1,174 @@
+"""
+app.py
+Flask server:
+  - /pay/daily and /pay/monthly  -> redirect user into PayFast checkout
+  - /payfast/notify              -> PayFast ITN (Instant Transaction Notification) webhook
+  - /                            -> simple status page
+
+Deploy this behind HTTPS (Railway, Render, a VPS + Caddy/Nginx, etc).
+PayFast requires the notify_url to be publicly reachable.
+"""
+
+import os
+import hashlib
+import urllib.parse
+import requests
+from flask import Flask, request, redirect, jsonify
+from dotenv import load_dotenv
+
+from db import (
+    init_db,
+    add_or_extend_subscription,
+    get_or_create_referral_code,
+    get_referral_stats,
+)
+from telegram_client import create_single_use_invite
+from email_client import send_invite_email
+
+load_dotenv()
+
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev")
+init_db()  # ensure tables exist regardless of how the app is started
+
+PAYFAST_MERCHANT_ID = os.getenv("PAYFAST_MERCHANT_ID")
+PAYFAST_MERCHANT_KEY = os.getenv("PAYFAST_MERCHANT_KEY")
+PAYFAST_PASSPHRASE = os.getenv("PAYFAST_PASSPHRASE", "")
+PAYFAST_MODE = os.getenv("PAYFAST_MODE", "live")
+PAYFAST_PROCESS_URL = (
+    "https://sandbox.payfast.co.za/eng/process"
+    if PAYFAST_MODE != "live"
+    else "https://www.payfast.co.za/eng/process"
+)
+
+DAILY_PRICE = os.getenv("DAILY_PRICE", "100")
+MONTHLY_PRICE = os.getenv("MONTHLY_PRICE", "1500")
+
+YOUR_DOMAIN = os.getenv("PUBLIC_DOMAIN", "https://your-domain.example.com")
+
+
+def build_signature(data: dict, passphrase: str) -> str:
+    pairs = [f"{k}={urllib.parse.quote_plus(str(v))}" for k, v in data.items() if v not in (None, "")]
+    query = "&".join(pairs)
+    if passphrase:
+        query += f"&passphrase={urllib.parse.quote_plus(passphrase)}"
+    return hashlib.md5(query.encode()).hexdigest()
+
+
+@app.route("/")
+def index():
+    return jsonify({"status": "ok", "service": "MT5 signals subscription server"})
+
+
+@app.route("/pay/<plan>")
+def pay(plan):
+    """plan = 'daily' or 'monthly'. Query params: ?email=user@example.com (required),
+    &ref=REFERRALCODE (optional, gives the referrer a free bonus day when this signup completes)."""
+    email = request.args.get("email")
+    ref_code = request.args.get("ref", "")
+    if not email:
+        return "Missing ?email= in the URL. Example: /pay/daily?email=you@example.com", 400
+    if plan not in ("daily", "monthly"):
+        return "Invalid plan - use 'daily' or 'monthly' in the URL, e.g. /pay/daily?email=...", 400
+
+    # Clear, readable checks instead of letting a bad config crash silently
+    problems = []
+    if not PAYFAST_MERCHANT_ID or PAYFAST_MERCHANT_ID.strip() in ("", "your_merchant_id"):
+        problems.append("PAYFAST_MERCHANT_ID is missing or still a placeholder in Railway's Variables.")
+    if not PAYFAST_MERCHANT_KEY or PAYFAST_MERCHANT_KEY.strip() in ("", "your_merchant_key"):
+        problems.append("PAYFAST_MERCHANT_KEY is missing or still a placeholder in Railway's Variables.")
+    if not YOUR_DOMAIN or "example.com" in YOUR_DOMAIN:
+        problems.append("PUBLIC_DOMAIN is missing or still the placeholder - set it to your real Railway URL.")
+
+    try:
+        amount_value = float(DAILY_PRICE if plan == "daily" else MONTHLY_PRICE)
+    except ValueError:
+        problems.append(
+            f"{'DAILY_PRICE' if plan == 'daily' else 'MONTHLY_PRICE'} isn't a valid number "
+            f"(currently: '{DAILY_PRICE if plan == 'daily' else MONTHLY_PRICE}')."
+        )
+        amount_value = None
+
+    if problems:
+        message = "Configuration problem(s) found:\n- " + "\n- ".join(problems)
+        return message, 500
+
+    data = {
+        "merchant_id": PAYFAST_MERCHANT_ID,
+        "merchant_key": PAYFAST_MERCHANT_KEY,
+        "return_url": f"{YOUR_DOMAIN}/thank-you",
+        "cancel_url": f"{YOUR_DOMAIN}/cancelled",
+        "notify_url": f"{YOUR_DOMAIN}/payfast/notify",
+        "email_address": email,
+        "m_payment_id": f"{plan}-{email}",
+        "amount": f"{amount_value:.2f}",
+        "item_name": f"MT5 Signals - {plan.capitalize()} subscription",
+        "custom_str1": plan,
+        "custom_str2": ref_code,
+    }
+    data["signature"] = build_signature(data, PAYFAST_PASSPHRASE)
+    query_string = urllib.parse.urlencode(data)
+    return redirect(f"{PAYFAST_PROCESS_URL}?{query_string}")
+
+
+@app.route("/payfast/notify", methods=["POST"])
+def payfast_notify():
+    """
+    PayFast calls this server-to-server after a successful payment.
+    IMPORTANT: In production, also validate the source IP and re-confirm
+    with PayFast's validate endpoint - see PayFast's ITN docs.
+    """
+    posted = request.form.to_dict()
+
+    payment_status = posted.get("payment_status")
+    email = posted.get("email_address")
+    plan = posted.get("custom_str1", "daily")
+    ref_code = posted.get("custom_str2") or None
+    payment_id = posted.get("pf_payment_id", "")
+
+    if payment_status == "COMPLETE" and email:
+        add_or_extend_subscription(email=email, plan=plan, payfast_payment_id=payment_id, referred_by_code=ref_code)
+        try:
+            invite_link = create_single_use_invite()
+            my_referral_code = get_or_create_referral_code(email)
+            my_referral_link = f"{YOUR_DOMAIN}/pay/daily?email=FRIEND_EMAIL&ref={my_referral_code}"
+            send_invite_email(
+                to_email=email,
+                invite_link=invite_link,
+                plan=plan,
+                referral_link=my_referral_link,
+            )
+            print(f"Subscriber {email} paid for {plan}. Invite emailed.")
+        except Exception as e:
+            print(f"Failed to create/send Telegram invite for {email}: {e}")
+
+    return "OK", 200
+
+
+@app.route("/my-referrals")
+def my_referrals():
+    email = request.args.get("email")
+    if not email:
+        return "Missing ?email=", 400
+    code = get_or_create_referral_code(email)
+    stats = get_referral_stats(email)
+    return jsonify({
+        "referral_code": code,
+        "referral_link": f"{YOUR_DOMAIN}/pay/daily?email=FRIEND_EMAIL&ref={code}",
+        "friends_referred": stats["referral_count"],
+        "bonus_days_earned": stats["bonus_days_earned"],
+    })
+
+
+@app.route("/thank-you")
+def thank_you():
+    return "Payment received - check your email for your Telegram invite link."
+
+
+@app.route("/cancelled")
+def cancelled():
+    return "Payment cancelled."
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
