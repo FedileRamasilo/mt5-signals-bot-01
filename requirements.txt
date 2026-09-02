@@ -1,6 +1,6 @@
-flask==3.0.3
-requests==2.32.3
-python-dotenv==1.0.1
-pandas>=2.2.3
-numpy>=2.0.1
+ flask==3.0.3
+requests==2.32.3 
+python-dotenv==1.0.1 
+pandas>=2.2.3 
+numpy>=2.0.1 
 APScheduler==3.10.4
