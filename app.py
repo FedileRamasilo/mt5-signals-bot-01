@@ -46,6 +46,14 @@ MONTHLY_PRICE = os.getenv("MONTHLY_PRICE", "1500")
 
 YOUR_DOMAIN = os.getenv("PUBLIC_DOMAIN", "https://your-domain.example.com")
 
+# --- Manual EFT (bank transfer) fallback, for launching before PayFast is fully wired up ---
+BANK_NAME = os.getenv("BANK_NAME", "Your Bank")
+BANK_ACCOUNT_HOLDER = os.getenv("BANK_ACCOUNT_HOLDER", "Your Name")
+BANK_ACCOUNT_NUMBER = os.getenv("BANK_ACCOUNT_NUMBER", "0000000000")
+BANK_BRANCH_CODE = os.getenv("BANK_BRANCH_CODE", "000000")
+BANK_ACCOUNT_TYPE = os.getenv("BANK_ACCOUNT_TYPE", "Cheque/Current")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")  # required to use the manual-approve link
+
 
 def build_signature(data: dict, passphrase: str) -> str:
     pairs = [f"{k}={urllib.parse.quote_plus(str(v))}" for k, v in data.items() if v not in (None, "")]
@@ -111,6 +119,77 @@ def pay(plan):
     return redirect(f"{PAYFAST_PROCESS_URL}?{query_string}")
 
 
+@app.route("/pay-eft/<plan>")
+def pay_eft(plan):
+    """
+    Manual bank transfer flow: shows the subscriber your banking details and a
+    unique reference number to use. You check your banking app, then use
+    /admin/approve to grant access once you see the payment land.
+    """
+    email = request.args.get("email")
+    ref_code = request.args.get("ref", "")
+    if not email:
+        return "Missing ?email= in the URL. Example: /pay-eft/daily?email=you@example.com", 400
+    if plan not in ("daily", "monthly"):
+        return "Invalid plan - use 'daily' or 'monthly'", 400
+
+    amount = DAILY_PRICE if plan == "daily" else MONTHLY_PRICE
+    # A short, readable reference so you can match it to your bank statement
+    reference = f"{plan.upper()[:3]}-{email.split('@')[0][:10].upper()}"
+
+    referral_note = f"&ref={ref_code}" if ref_code else ""
+
+    return f"""
+    <html><body style="font-family: sans-serif; max-width: 500px; margin: 40px auto; line-height: 1.6;">
+        <h2>Pay via Bank Transfer</h2>
+        <p><b>Plan:</b> {plan.capitalize()}<br>
+        <b>Amount:</b> R{amount}</p>
+        <p><b>Bank:</b> {BANK_NAME}<br>
+        <b>Account holder:</b> {BANK_ACCOUNT_HOLDER}<br>
+        <b>Account number:</b> {BANK_ACCOUNT_NUMBER}<br>
+        <b>Branch code:</b> {BANK_BRANCH_CODE}<br>
+        <b>Account type:</b> {BANK_ACCOUNT_TYPE}</p>
+        <p><b>Reference (important - use this exact reference):</b><br>
+        <span style="font-size: 1.3em; background:#eee; padding: 4px 8px;">{reference}</span></p>
+        <p>Once you've made the transfer, your access will be activated once the payment
+        is confirmed - this can take a few minutes to a few hours depending on your bank.</p>
+        <p style="color:#666; font-size:0.9em;">Your email on file: {email}{"<br>Referred by: " + ref_code if ref_code else ""}</p>
+    </body></html>
+    """
+
+
+@app.route("/admin/approve")
+def admin_approve():
+    """
+    Manual approval endpoint - use this yourself once you've checked your banking
+    app and confirmed a payment landed. Requires the secret ADMIN_SECRET you set
+    in Railway, so no one else can grant themselves free access.
+
+    Example: /admin/approve?email=them@example.com&plan=daily&secret=YOUR_ADMIN_SECRET
+    """
+    secret = request.args.get("secret", "")
+    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        return "Not authorized - check your ADMIN_SECRET.", 403
+
+    email = request.args.get("email")
+    plan = request.args.get("plan", "daily")
+    ref_code = request.args.get("ref") or None
+    if not email:
+        return "Missing ?email=", 400
+    if plan not in ("daily", "monthly"):
+        return "Invalid plan", 400
+
+    add_or_extend_subscription(email=email, plan=plan, payfast_payment_id="manual-eft", referred_by_code=ref_code)
+    try:
+        invite_link = create_single_use_invite()
+        my_referral_code = get_or_create_referral_code(email)
+        my_referral_link = f"{YOUR_DOMAIN}/pay/daily?email=FRIEND_EMAIL&ref={my_referral_code}"
+        send_invite_email(to_email=email, invite_link=invite_link, plan=plan, referral_link=my_referral_link)
+        return f"Approved {email} for {plan} plan. Invite emailed."
+    except Exception as e:
+        return f"Approved in database, but failed to send invite email: {e}", 500
+
+
 @app.route("/payfast/notify", methods=["POST"])
 def payfast_notify():
     """
@@ -172,3 +251,4 @@ def cancelled():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+
