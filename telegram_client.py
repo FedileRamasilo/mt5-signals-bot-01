@@ -5,6 +5,7 @@ subscribers based on payment status.
 """
 
 import os
+import time
 import requests
 from dotenv import load_dotenv
 
@@ -24,7 +25,7 @@ DISPLAY_NAMES = {
 
 def format_signal_message(signal: dict) -> str:
     name = DISPLAY_NAMES.get(signal["symbol"], signal["symbol"])
-    arrow = "🟢 BUY" if signal["direction"] == "BUY" else "🔴 SELL"
+    arrow = "ðŸŸ¢ BUY" if signal["direction"] == "BUY" else "ðŸ”´ SELL"
     return (
         f"*{name}*\n"
         f"{arrow}\n\n"
@@ -51,9 +52,9 @@ def post_signal(signal: dict, channel_id: str | None = None):
 def format_free_signal_message(signal: dict, subscribe_link: str) -> str:
     """The free daily proof-signal - same quality as paid, with a subtle upsell."""
     name = DISPLAY_NAMES.get(signal["symbol"], signal["symbol"])
-    arrow = "🟢 BUY" if signal["direction"] == "BUY" else "🔴 SELL"
+    arrow = "ðŸŸ¢ BUY" if signal["direction"] == "BUY" else "ðŸ”´ SELL"
     return (
-        f"🎁 *Today's Free Signal*\n\n"
+        f"ðŸŽ *Today's Free Signal*\n\n"
         f"*{name}*\n"
         f"{arrow}\n\n"
         f"Entry: `{signal['entry']}`\n"
@@ -81,9 +82,10 @@ def post_free_signal(signal: dict, subscribe_link: str):
 
 def create_single_use_invite(expire_seconds: int = 86400) -> str:
     """Create a one-time invite link for a newly paid subscriber. Bot must be channel admin."""
+    expire_timestamp = int(time.time()) + expire_seconds  # Telegram wants a Unix timestamp, not an offset
     resp = requests.post(
         f"{API_BASE}/createChatInviteLink",
-        json={"chat_id": CHANNEL_ID, "member_limit": 1, "expire_date_offset": expire_seconds},
+        json={"chat_id": CHANNEL_ID, "member_limit": 1, "expire_date": expire_timestamp},
         timeout=15,
     )
     resp.raise_for_status()
@@ -94,3 +96,4 @@ def remove_subscriber(telegram_user_id: int):
     """Kick + immediately unban so an expired subscriber can rejoin after re-paying."""
     requests.post(f"{API_BASE}/banChatMember", json={"chat_id": CHANNEL_ID, "user_id": telegram_user_id}, timeout=15)
     requests.post(f"{API_BASE}/unbanChatMember", json={"chat_id": CHANNEL_ID, "user_id": telegram_user_id}, timeout=15)
+
