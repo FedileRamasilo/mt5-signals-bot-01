@@ -94,7 +94,15 @@ def add_or_extend_subscription(
     duration = timedelta(days=1) if plan == "daily" else timedelta(days=30)
     expires_at = now + duration
 
-    own_code = get_or_create_referral_code(email)
+    # Only the first subscription row for this email stores their referral code -
+    # renewals leave it NULL, since referral_code must be unique and
+    # get_or_create_referral_code() already knows to find the original row.
+    existing = conn.execute(
+        "SELECT referral_code FROM subscribers WHERE email = ? AND referral_code IS NOT NULL LIMIT 1",
+        (email,),
+    ).fetchone()
+    own_code = existing["referral_code"] if existing else generate_referral_code(email)
+    code_for_this_row = None if existing else own_code
 
     conn.execute(
         """
@@ -104,7 +112,7 @@ def add_or_extend_subscription(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (email, telegram_user_id, plan, payfast_payment_id, expires_at.isoformat(), now.isoformat(),
-         own_code, referred_by_code),
+         code_for_this_row, referred_by_code),
     )
     conn.commit()
     conn.close()
