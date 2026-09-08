@@ -167,6 +167,8 @@ def admin_approve():
 
     Example: /admin/approve?email=them@example.com&plan=daily&secret=YOUR_ADMIN_SECRET
     """
+    import traceback
+
     secret = request.args.get("secret", "")
     if not ADMIN_SECRET or secret != ADMIN_SECRET:
         return "Not authorized - check your ADMIN_SECRET.", 403
@@ -179,15 +181,19 @@ def admin_approve():
     if plan not in ("daily", "monthly"):
         return "Invalid plan", 400
 
-    add_or_extend_subscription(email=email, plan=plan, payfast_payment_id="manual-eft", referred_by_code=ref_code)
+    try:
+        add_or_extend_subscription(email=email, plan=plan, payfast_payment_id="manual-eft", referred_by_code=ref_code)
+    except Exception:
+        return f"<pre>Failed while saving the subscription:\n\n{traceback.format_exc()}</pre>", 500
+
     try:
         invite_link = create_single_use_invite()
         my_referral_code = get_or_create_referral_code(email)
         my_referral_link = f"{YOUR_DOMAIN}/pay/daily?email=FRIEND_EMAIL&ref={my_referral_code}"
         send_invite_email(to_email=email, invite_link=invite_link, plan=plan, referral_link=my_referral_link)
         return f"Approved {email} for {plan} plan. Invite emailed."
-    except Exception as e:
-        return f"Approved in database, but failed to send invite email: {e}", 500
+    except Exception:
+        return f"<pre>Approved in database, but failed on invite/email step:\n\n{traceback.format_exc()}</pre>", 500
 
 
 @app.route("/payfast/notify", methods=["POST"])
@@ -251,4 +257,3 @@ def cancelled():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-
