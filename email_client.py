@@ -12,11 +12,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_HOST = (os.getenv("SMTP_HOST") or "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USERNAME)
+SMTP_USERNAME = (os.getenv("SMTP_USERNAME") or "").strip()
+SMTP_PASSWORD = (os.getenv("SMTP_PASSWORD") or "").strip()
+FROM_EMAIL = (os.getenv("FROM_EMAIL") or SMTP_USERNAME).strip()
 FROM_NAME = os.getenv("FROM_NAME", "Market Signals")
 
 
@@ -44,7 +44,13 @@ def send_invite_email(to_email: str, invite_link: str, plan: str, referral_link:
     msg["From"] = f"{FROM_NAME} <{FROM_EMAIL}>"
     msg["To"] = to_email
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+    if not SMTP_HOST or not SMTP_HOST.strip():
+        raise RuntimeError(
+            f"SMTP_HOST is empty or not set (current value: {SMTP_HOST!r}). "
+            f"Set it in Railway's Variables tab, e.g. SMTP_HOST=smtp.gmail.com"
+        )
+
+    with smtplib.SMTP(SMTP_HOST.strip(), SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USERNAME, SMTP_PASSWORD)
         server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
