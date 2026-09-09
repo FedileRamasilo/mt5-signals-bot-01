@@ -88,7 +88,17 @@ def create_single_use_invite(expire_seconds: int = 86400) -> str:
         json={"chat_id": CHANNEL_ID, "member_limit": 1, "expire_date": expire_timestamp},
         timeout=15,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        # Surface Telegram's actual error description (e.g. "chat not found",
+        # "CHAT_ADMIN_REQUIRED") instead of a generic 400 with no explanation.
+        try:
+            detail = resp.json().get("description", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(
+            f"Telegram createChatInviteLink failed (status {resp.status_code}): {detail} "
+            f"[chat_id used: {CHANNEL_ID!r}]"
+        )
     return resp.json()["result"]["invite_link"]
 
 
