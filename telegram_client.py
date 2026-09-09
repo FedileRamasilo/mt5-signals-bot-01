@@ -96,4 +96,3 @@ def remove_subscriber(telegram_user_id: int):
     """Kick + immediately unban so an expired subscriber can rejoin after re-paying."""
     requests.post(f"{API_BASE}/banChatMember", json={"chat_id": CHANNEL_ID, "user_id": telegram_user_id}, timeout=15)
     requests.post(f"{API_BASE}/unbanChatMember", json={"chat_id": CHANNEL_ID, "user_id": telegram_user_id}, timeout=15)
-
