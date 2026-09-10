@@ -11,7 +11,7 @@ import time
 import logging
 import os
 import random
-from datetime import date
+from datetime import date, datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from price_feed import fetch_all
@@ -85,8 +85,12 @@ def prune_expired_subscribers():
 if __name__ == "__main__":
     init_db()
     scheduler = BlockingScheduler()
-    scheduler.add_job(check_signals, "interval", minutes=15, next_run_time=None)
-    scheduler.add_job(prune_expired_subscribers, "interval", hours=1)
+    # next_run_time=datetime.now() makes the first check run immediately on
+    # startup instead of waiting 15 minutes - important for testing, and
+    # avoids the bug where passing next_run_time=None actually PAUSES the
+    # job in APScheduler (it never runs at all, silently).
+    scheduler.add_job(check_signals, "interval", minutes=15, next_run_time=datetime.now())
+    scheduler.add_job(prune_expired_subscribers, "interval", hours=1, next_run_time=datetime.now())
     log.info("Scheduler started. Checking signals every 15 minutes.")
     try:
         scheduler.start()
