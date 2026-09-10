@@ -21,8 +21,9 @@ from db import (
     add_or_extend_subscription,
     get_or_create_referral_code,
     get_referral_stats,
+    get_performance_stats,
 )
-from telegram_client import create_single_use_invite
+from telegram_client import create_single_use_invite, post_signal
 from email_client import send_invite_email
 
 load_dotenv()
@@ -196,6 +197,37 @@ def admin_approve():
         return f"<pre>Approved in database, but failed on invite/email step:\n\n{traceback.format_exc()}</pre>", 500
 
 
+@app.route("/admin/test-signal")
+def admin_test_signal():
+    """
+    Posts a sample signal to your private channel immediately, so you can see
+    the formatting without waiting for a real EMA/RSI crossover to trigger.
+    Requires ADMIN_SECRET. Example:
+    /admin/test-signal?secret=YOUR_ADMIN_SECRET&symbol=BTC
+    """
+    import traceback
+
+    secret = request.args.get("secret", "")
+    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        return "Not authorized - check your ADMIN_SECRET.", 403
+
+    symbol = request.args.get("symbol", "BTC").upper()
+    sample_signal = {
+        "symbol": symbol,
+        "direction": "BUY",
+        "entry": 65432.10,
+        "sl": 64800.00,
+        "tp": 66500.00,
+        "rsi": 58.3,
+        "timestamp": "TEST POST - not a real signal",
+    }
+    try:
+        post_signal(sample_signal)
+        return f"Test signal posted to your private channel for {symbol}. Check Telegram."
+    except Exception:
+        return f"<pre>Failed to post test signal:\n\n{traceback.format_exc()}</pre>", 500
+
+
 @app.route("/payfast/notify", methods=["POST"])
 def payfast_notify():
     """
@@ -243,6 +275,48 @@ def my_referrals():
         "friends_referred": stats["referral_count"],
         "bonus_days_earned": stats["bonus_days_earned"],
     })
+
+
+@app.route("/performance")
+def performance():
+    """
+    Public track record - every signal ever posted, and whether it hit TP
+    (win) or SL (loss), tracked automatically. This is the single biggest
+    trust-builder for a signals service: real numbers, good and bad, not a
+    cherry-picked highlight reel.
+    """
+    stats = get_performance_stats()
+    win_rate_display = f"{stats['win_rate']}%" if stats["win_rate"] is not None else "Not enough closed signals yet"
+
+    rows_html = ""
+    for s in stats["recent"]:
+        color = {"win": "green", "loss": "red", "open": "#888"}.get(s["outcome"], "#888")
+        rows_html += (
+            f"<tr><td>{s['posted_at'][:16]}</td><td>{s['symbol']}</td><td>{s['direction']}</td>"
+            f"<td>{s['entry']}</td>"
+            f"<td style='color:{color};font-weight:bold;'>{s['outcome'].upper()}</td></tr>"
+        )
+
+    return f"""
+    <html><body style="font-family: sans-serif; max-width: 700px; margin: 40px auto; line-height: 1.6;">
+        <h2>Our Track Record</h2>
+        <p>Every signal we've posted, tracked automatically - wins and losses, no cherry-picking.</p>
+        <div style="display:flex; gap: 24px; margin: 24px 0;">
+            <div><b style="font-size:1.5em;">{stats['total_signals']}</b><br>Total signals</div>
+            <div><b style="font-size:1.5em;color:green;">{stats['wins']}</b><br>Wins</div>
+            <div><b style="font-size:1.5em;color:red;">{stats['losses']}</b><br>Losses</div>
+            <div><b style="font-size:1.5em;">{stats['open']}</b><br>Still open</div>
+            <div><b style="font-size:1.5em;">{win_rate_display}</b><br>Win rate</div>
+        </div>
+        <h3>Recent Signals</h3>
+        <table style="width:100%; border-collapse: collapse;">
+            <tr style="text-align:left; border-bottom: 2px solid #ccc;">
+                <th>Posted</th><th>Symbol</th><th>Direction</th><th>Entry</th><th>Outcome</th>
+            </tr>
+            {rows_html}
+        </table>
+    </body></html>
+    """
 
 
 @app.route("/thank-you")
