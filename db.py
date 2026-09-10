@@ -49,6 +49,21 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            direction TEXT,         -- 'BUY' or 'SELL'
+            entry REAL,
+            sl REAL,
+            tp REAL,
+            posted_at TEXT,
+            outcome TEXT DEFAULT 'open',   -- 'open', 'win', or 'loss'
+            closed_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -180,4 +195,61 @@ def get_active_count() -> int:
     ).fetchone()["c"]
     conn.close()
     return count
+
+
+def log_signal(symbol: str, direction: str, entry: float, sl: float, tp: float) -> int:
+    """Record a signal as posted/open. Returns its row id for later outcome updates."""
+    conn = get_conn()
+    now = datetime.utcnow().isoformat()
+    cur = conn.execute(
+        "INSERT INTO signals (symbol, direction, entry, sl, tp, posted_at, outcome) VALUES (?, ?, ?, ?, ?, ?, 'open')",
+        (symbol, direction, entry, sl, tp, now),
+    )
+    conn.commit()
+    signal_id = cur.lastrowid
+    conn.close()
+    return signal_id
+
+
+def get_open_signals() -> list:
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM signals WHERE outcome = 'open'").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def close_signal(signal_id: int, outcome: str):
+    """outcome should be 'win' or 'loss'."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE signals SET outcome = ?, closed_at = ? WHERE id = ?",
+        (outcome, datetime.utcnow().isoformat(), signal_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_performance_stats() -> dict:
+    """Aggregate win/loss stats for the public performance dashboard."""
+    conn = get_conn()
+    total = conn.execute("SELECT COUNT(*) as c FROM signals").fetchone()["c"]
+    wins = conn.execute("SELECT COUNT(*) as c FROM signals WHERE outcome = 'win'").fetchone()["c"]
+    losses = conn.execute("SELECT COUNT(*) as c FROM signals WHERE outcome = 'loss'").fetchone()["c"]
+    open_count = conn.execute("SELECT COUNT(*) as c FROM signals WHERE outcome = 'open'").fetchone()["c"]
+    closed = wins + losses
+    win_rate = round((wins / closed) * 100, 1) if closed > 0 else None
+
+    recent = conn.execute(
+        "SELECT symbol, direction, entry, sl, tp, outcome, posted_at FROM signals ORDER BY posted_at DESC LIMIT 20"
+    ).fetchall()
+    conn.close()
+
+    return {
+        "total_signals": total,
+        "wins": wins,
+        "losses": losses,
+        "open": open_count,
+        "win_rate": win_rate,
+        "recent": [dict(r) for r in recent],
+    }
 
