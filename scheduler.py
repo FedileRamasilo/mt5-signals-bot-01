@@ -14,10 +14,10 @@ import random
 from datetime import date, datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from price_feed import fetch_all
+from price_feed import fetch_all, fetch_candles
 from signal_engine import generate_signal
 from telegram_client import post_signal, post_free_signal, remove_subscriber
-from db import init_db, get_expired_subscribers
+from db import init_db, get_expired_subscribers, log_signal, get_open_signals, close_signal
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -51,6 +51,13 @@ def check_signals():
             if signal:
                 log.info(f"Signal found: {signal}")
                 post_signal(signal)
+                log_signal(
+                    symbol=signal["symbol"],
+                    direction=signal["direction"],
+                    entry=signal["entry"],
+                    sl=signal["sl"],
+                    tp=signal["tp"],
+                )
                 todays_signals.append(signal)
             else:
                 log.info(f"No signal for {symbol_key} this check.")
@@ -82,6 +89,53 @@ def prune_expired_subscribers():
             log.error(f"Failed to remove subscriber {sub['email']}: {e}")
 
 
+def check_open_signal_outcomes():
+    """
+    For every still-open signal, check the latest price and mark it a win if
+    price has touched the take-profit level, or a loss if it's touched the
+    stop-loss - this is what powers the public performance dashboard, so the
+    win rate you show subscribers is always real, not cherry-picked.
+    """
+    open_signals = get_open_signals()
+    if not open_signals:
+        return
+
+    log.info(f"Checking outcomes for {len(open_signals)} open signal(s)...")
+    # Group by symbol so we only fetch each symbol's price once
+    by_symbol = {}
+    for s in open_signals:
+        by_symbol.setdefault(s["symbol"], []).append(s)
+
+    for symbol_key, signals_for_symbol in by_symbol.items():
+        try:
+            df = fetch_candles(symbol_key, interval="15min", outputsize=5)
+            latest_high = df["high"].max()
+            latest_low = df["low"].min()
+        except Exception as e:
+            log.error(f"Failed to fetch price for outcome check on {symbol_key}: {e}")
+            continue
+
+        for s in signals_for_symbol:
+            direction = s["direction"]
+            sl, tp = s["sl"], s["tp"]
+            outcome = None
+
+            if direction == "BUY":
+                if latest_high >= tp:
+                    outcome = "win"
+                elif latest_low <= sl:
+                    outcome = "loss"
+            else:  # SELL
+                if latest_low <= tp:
+                    outcome = "win"
+                elif latest_high >= sl:
+                    outcome = "loss"
+
+            if outcome:
+                close_signal(s["id"], outcome)
+                log.info(f"Signal #{s['id']} ({symbol_key} {direction}) closed as {outcome.upper()}")
+
+
 if __name__ == "__main__":
     init_db()
     scheduler = BlockingScheduler()
@@ -90,6 +144,7 @@ if __name__ == "__main__":
     # avoids the bug where passing next_run_time=None actually PAUSES the
     # job in APScheduler (it never runs at all, silently).
     scheduler.add_job(check_signals, "interval", minutes=15, next_run_time=datetime.now())
+    scheduler.add_job(check_open_signal_outcomes, "interval", minutes=15, next_run_time=datetime.now())
     scheduler.add_job(prune_expired_subscribers, "interval", hours=1, next_run_time=datetime.now())
     log.info("Scheduler started. Checking signals every 15 minutes.")
     try:
