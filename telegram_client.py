@@ -25,7 +25,7 @@ DISPLAY_NAMES = {
 
 def format_signal_message(signal: dict) -> str:
     name = DISPLAY_NAMES.get(signal["symbol"], signal["symbol"])
-    arrow = "ðŸŸ¢ BUY" if signal["direction"] == "BUY" else "ðŸ”´ SELL"
+    arrow = "\U0001F7E2 BUY" if signal["direction"] == "BUY" else "\U0001F534 SELL"
     return (
         f"*{name}*\n"
         f"{arrow}\n\n"
@@ -52,9 +52,9 @@ def post_signal(signal: dict, channel_id: str | None = None):
 def format_free_signal_message(signal: dict, subscribe_link: str) -> str:
     """The free daily proof-signal - same quality as paid, with a subtle upsell."""
     name = DISPLAY_NAMES.get(signal["symbol"], signal["symbol"])
-    arrow = "ðŸŸ¢ BUY" if signal["direction"] == "BUY" else "ðŸ”´ SELL"
+    arrow = "\U0001F7E2 BUY" if signal["direction"] == "BUY" else "\U0001F534 SELL"
     return (
-        f"ðŸŽ *Today's Free Signal*\n\n"
+        f"\U0001F381 *Today's Free Signal*\n\n"
         f"*{name}*\n"
         f"{arrow}\n\n"
         f"Entry: `{signal['entry']}`\n"
