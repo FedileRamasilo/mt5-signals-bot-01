@@ -46,7 +46,7 @@ def send_invite_email(to_email: str, invite_link: str, plan: str, referral_link:
         f"<p>Thanks for subscribing to the {plan} plan!</p>"
         f"<p>Join the private Telegram channel here (one-time use link):<br>"
         f"<a href='{invite_link}'>{invite_link}</a></p>"
-        f"<p>Signals for BTC/USD, USD/CHF, and Gold will be posted there as they trigger.</p>"
+        f"<p>Signals for BTC/USD, USD/CHF, Gold, and USD/ZAR will be posted there as they trigger.</p>"
         f"{referral_block}"
         f"<p style='color:#666;font-size:0.9em;'>Note: this is market analysis, not personalised "
         f"financial advice - always manage your own risk.</p>"
