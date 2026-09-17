@@ -20,6 +20,7 @@ DISPLAY_NAMES = {
     "BTC": "Bitcoin (BTC/USD)",
     "USDCHF": "USD/CHF",
     "GOLD": "Gold (XAU/USD)",
+    "USDZAR": "USD/ZAR",
 }
 
 
@@ -45,7 +46,12 @@ def post_signal(signal: dict, channel_id: str | None = None):
         json={"chat_id": channel_id or CHANNEL_ID, "text": text, "parse_mode": "Markdown"},
         timeout=15,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        try:
+            detail = resp.json().get("description", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Telegram sendMessage failed (status {resp.status_code}): {detail}\nMessage text was:\n{text}")
     return resp.json()
 
 
@@ -61,7 +67,7 @@ def format_free_signal_message(signal: dict, subscribe_link: str) -> str:
         f"Stop Loss: `{signal['sl']}`\n"
         f"Take Profit: `{signal['tp']}`\n\n"
         f"This is one of several signals we send paid subscribers daily across "
-        f"BTC, USD/CHF, and Gold.\n"
+        f"BTC, USD/CHF, Gold, and USD/ZAR.\n"
         f"Subscribe for the full daily feed: {subscribe_link}\n\n"
         f"_Not financial advice. Trade your own risk management._"
     )
@@ -76,7 +82,12 @@ def post_free_signal(signal: dict, subscribe_link: str):
         json={"chat_id": FREE_CHANNEL_ID, "text": text, "parse_mode": "Markdown"},
         timeout=15,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        try:
+            detail = resp.json().get("description", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Telegram sendMessage (free channel) failed (status {resp.status_code}): {detail}\nMessage text was:\n{text}")
     return resp.json()
 
 
