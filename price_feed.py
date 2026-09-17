@@ -1,6 +1,6 @@
 """
 price_feed.py
-Pulls recent OHLC candles for BTC/USD, USD/CHF, and XAU/USD (gold) from TwelveData.
+Pulls recent OHLC candles for BTC/USD, USD/CHF, XAU/USD (gold), and USD/ZAR from TwelveData.
 Free tier: 800 requests/day, 8/minute - plenty for a scheduled signal bot checking
 every 15-30 minutes across 3 symbols.
 """
@@ -20,13 +20,14 @@ SYMBOLS = {
     "BTC": "BTC/USD",
     "USDCHF": "USD/CHF",
     "GOLD": "XAU/USD",
+    "USDZAR": "USD/ZAR",
 }
 
 
 def fetch_candles(symbol_key: str, interval: str = "15min", outputsize: int = 100) -> pd.DataFrame:
     """
     Fetch recent candles for one of our tracked instruments.
-    symbol_key: one of "BTC", "USDCHF", "GOLD"
+    symbol_key: one of "BTC", "USDCHF", "GOLD", "USDZAR"
     interval: TwelveData interval string, e.g. "15min", "1h", "4h"
     Returns a DataFrame sorted oldest -> newest with columns:
     datetime, open, high, low, close, volume
@@ -64,5 +65,5 @@ def fetch_all(interval: str = "15min", outputsize: int = 100) -> dict:
 if __name__ == "__main__":
     # Quick manual test - run `python price_feed.py` after setting TWELVEDATA_API_KEY
     for key, df in fetch_all().items():
-        print(f"\n{key} — last 3 candles:")
+        print(f"\n{key} â€” last 3 candles:")
         print(df.tail(3)[["datetime", "open", "high", "low", "close"]])
