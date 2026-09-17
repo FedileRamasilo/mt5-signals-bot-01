@@ -1,7 +1,7 @@
 """
 scheduler.py
 Runs alongside app.py (or as a separate process/worker) to:
-  1. Check for new trade signals every 15 minutes and post them to Telegram
+  1. Check for new trade signals right after each M15 candle closes, and post them to Telegram
   2. Remove subscribers whose access has expired
 
 Run with: python scheduler.py
@@ -13,6 +13,7 @@ import os
 import random
 from datetime import date, datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from price_feed import fetch_all, fetch_candles
 from signal_engine import generate_signal
@@ -50,7 +51,8 @@ def check_signals():
             signal = generate_signal(symbol_key, df)
             if signal:
                 log.info(f"Signal found: {signal}")
-                post_signal(signal)
+                # Log to the database FIRST - this way even if Telegram delivery
+                # fails, the signal still shows up on /performance and isn't lost.
                 log_signal(
                     symbol=signal["symbol"],
                     direction=signal["direction"],
@@ -58,6 +60,7 @@ def check_signals():
                     sl=signal["sl"],
                     tp=signal["tp"],
                 )
+                post_signal(signal)
                 todays_signals.append(signal)
             else:
                 log.info(f"No signal for {symbol_key} this check.")
@@ -139,14 +142,19 @@ def check_open_signal_outcomes():
 if __name__ == "__main__":
     init_db()
     scheduler = BlockingScheduler()
-    # next_run_time=datetime.now() makes the first check run immediately on
-    # startup instead of waiting 15 minutes - important for testing, and
-    # avoids the bug where passing next_run_time=None actually PAUSES the
-    # job in APScheduler (it never runs at all, silently).
-    scheduler.add_job(check_signals, "interval", minutes=15, next_run_time=datetime.now())
-    scheduler.add_job(check_open_signal_outcomes, "interval", minutes=15, next_run_time=datetime.now())
+
+    # CronTrigger fires at :01, :16, :31, :46 past every hour - one minute
+    # after each real M15 candle closes (00, 15, 30, 45), giving TwelveData
+    # a moment to finalize the candle. This replaces the old "interval"
+    # trigger, which ran every 15 minutes from whenever the process happened
+    # to start - misaligned with real candle close times, which is why
+    # signals could lag behind what you'd see live in MT5.
+    signal_check_trigger = CronTrigger(minute="1,16,31,46", second=0)
+
+    scheduler.add_job(check_signals, signal_check_trigger, next_run_time=datetime.now())
+    scheduler.add_job(check_open_signal_outcomes, signal_check_trigger, next_run_time=datetime.now())
     scheduler.add_job(prune_expired_subscribers, "interval", hours=1, next_run_time=datetime.now())
-    log.info("Scheduler started. Checking signals every 15 minutes.")
+    log.info("Scheduler started. Checking signals at :01/:16/:31/:46 past each hour (aligned to M15 candle closes).")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
