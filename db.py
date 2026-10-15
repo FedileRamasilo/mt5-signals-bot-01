@@ -34,10 +34,18 @@ def init_db():
             expires_at TEXT,
             created_at TEXT,
             referral_code TEXT UNIQUE,     -- this subscriber's own code to share
-            referred_by_code TEXT          -- code of whoever referred them, if any
+            referred_by_code TEXT,         -- code of whoever referred them, if any
+            amount REAL                    -- what they actually paid, for revenue tracking
         )
         """
     )
+    # Safe migration: adds the 'amount' column if the table already existed
+    # without it (e.g. persistent storage from before this change).
+    try:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN amount REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS referral_bonuses (
@@ -103,10 +111,11 @@ def add_or_extend_subscription(
     payfast_payment_id: str,
     telegram_user_id: int | None = None,
     referred_by_code: str | None = None,
+    amount: float | None = None,
 ) -> datetime:
     conn = get_conn()
     now = datetime.utcnow()
-    duration = timedelta(days=1) if plan == "daily" else timedelta(days=30)
+    duration = timedelta(hours=12) if plan == "daily" else timedelta(days=30)
     expires_at = now + duration
 
     # Only the first subscription row for this email stores their referral code -
@@ -123,11 +132,11 @@ def add_or_extend_subscription(
         """
         INSERT INTO subscribers
             (email, telegram_user_id, plan, payfast_payment_id, expires_at, created_at,
-             referral_code, referred_by_code)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             referral_code, referred_by_code, amount)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (email, telegram_user_id, plan, payfast_payment_id, expires_at.isoformat(), now.isoformat(),
-         code_for_this_row, referred_by_code),
+         code_for_this_row, referred_by_code, amount),
     )
     conn.commit()
     conn.close()
@@ -252,4 +261,53 @@ def get_performance_stats() -> dict:
         "win_rate": win_rate,
         "recent": [dict(r) for r in recent],
     }
+
+
+def get_revenue_today() -> dict:
+    """Total revenue collected today (UTC), plus a breakdown by plan and payment count."""
+    conn = get_conn()
+    today_start = datetime.utcnow().strftime("%Y-%m-%d")
+
+    rows = conn.execute(
+        "SELECT plan, amount FROM subscribers WHERE created_at >= ? AND amount IS NOT NULL",
+        (today_start,),
+    ).fetchall()
+    conn.close()
+
+    total = sum(r["amount"] for r in rows)
+    by_plan = {}
+    for r in rows:
+        by_plan[r["plan"]] = by_plan.get(r["plan"], 0) + r["amount"]
+
+    return {
+        "date": today_start,
+        "total_revenue": round(total, 2),
+        "payment_count": len(rows),
+        "by_plan": {k: round(v, 2) for k, v in by_plan.items()},
+    }
+
+
+def get_revenue_summary(days: int = 7) -> list:
+    """Daily revenue totals for the last N days - each as {date, total, count}."""
+    conn = get_conn()
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    rows = conn.execute(
+        "SELECT created_at, amount FROM subscribers WHERE created_at >= ? AND amount IS NOT NULL ORDER BY created_at",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+
+    by_day = {}
+    for r in rows:
+        day = r["created_at"][:10]  # YYYY-MM-DD
+        if day not in by_day:
+            by_day[day] = {"date": day, "total": 0.0, "count": 0}
+        by_day[day]["total"] += r["amount"]
+        by_day[day]["count"] += 1
+
+    for day in by_day:
+        by_day[day]["total"] = round(by_day[day]["total"], 2)
+
+    return sorted(by_day.values(), key=lambda d: d["date"], reverse=True)
 
