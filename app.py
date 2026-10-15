@@ -22,6 +22,8 @@ from db import (
     get_or_create_referral_code,
     get_referral_stats,
     get_performance_stats,
+    get_revenue_today,
+    get_revenue_summary,
 )
 from telegram_client import create_single_use_invite, post_signal
 from email_client import send_invite_email
@@ -135,6 +137,7 @@ def pay_eft(plan):
         return "Invalid plan - use 'daily' or 'monthly'", 400
 
     amount = DAILY_PRICE if plan == "daily" else MONTHLY_PRICE
+    access_duration = "12 hours" if plan == "daily" else "30 days"
     # A short, readable reference so you can match it to your bank statement
     reference = f"{plan.upper()[:3]}-{email.split('@')[0][:10].upper()}"
 
@@ -143,7 +146,7 @@ def pay_eft(plan):
     return f"""
     <html><body style="font-family: sans-serif; max-width: 500px; margin: 40px auto; line-height: 1.6;">
         <h2>Pay via Bank Transfer</h2>
-        <p><b>Plan:</b> {plan.capitalize()}<br>
+        <p><b>Plan:</b> {plan.capitalize()} ({access_duration} access)<br>
         <b>Amount:</b> R{amount}</p>
         <p><b>Bank:</b> {BANK_NAME}<br>
         <b>Account holder:</b> {BANK_ACCOUNT_HOLDER}<br>
@@ -182,8 +185,12 @@ def admin_approve():
     if plan not in ("daily", "monthly"):
         return "Invalid plan", 400
 
+    paid_amount = expected_amount_for_plan(plan)
     try:
-        add_or_extend_subscription(email=email, plan=plan, payfast_payment_id="manual-eft", referred_by_code=ref_code)
+        add_or_extend_subscription(
+            email=email, plan=plan, payfast_payment_id="manual-eft",
+            referred_by_code=ref_code, amount=paid_amount,
+        )
     except Exception:
         return f"<pre>Failed while saving the subscription:\n\n{traceback.format_exc()}</pre>", 500
 
@@ -228,12 +235,45 @@ def admin_test_signal():
         return f"<pre>Failed to post test signal:\n\n{traceback.format_exc()}</pre>", 500
 
 
+PAYFAST_VALIDATE_URL = (
+    "https://sandbox.payfast.co.za/eng/query/validate"
+    if PAYFAST_MODE != "live"
+    else "https://www.payfast.co.za/eng/query/validate"
+)
+
+
+def verify_payfast_signature(posted: dict, passphrase: str) -> bool:
+    """Recompute the signature from the posted data (excluding 'signature' itself)
+    and compare it to what PayFast sent - confirms the data wasn't tampered with."""
+    received_signature = posted.get("signature", "")
+    data_without_signature = {k: v for k, v in posted.items() if k != "signature"}
+    expected_signature = build_signature(data_without_signature, passphrase)
+    return expected_signature == received_signature
+
+
+def verify_with_payfast_server(posted: dict) -> bool:
+    """PayFast's official ITN check: post the notification data back to their
+    validate endpoint. Only trust the payment if they confirm it's genuine -
+    this stops anyone from faking a request straight to your /payfast/notify URL."""
+    try:
+        resp = requests.post(PAYFAST_VALIDATE_URL, data=posted, timeout=15)
+        return resp.text.strip() == "VALID"
+    except Exception:
+        return False
+
+
+def expected_amount_for_plan(plan: str) -> float:
+    return float(DAILY_PRICE if plan == "daily" else MONTHLY_PRICE)
+
+
 @app.route("/payfast/notify", methods=["POST"])
 def payfast_notify():
     """
     PayFast calls this server-to-server after a successful payment.
-    IMPORTANT: In production, also validate the source IP and re-confirm
-    with PayFast's validate endpoint - see PayFast's ITN docs.
+    Follows PayFast's official ITN validation: verify the signature, confirm
+    the notification with PayFast's own validate endpoint, and check the
+    amount matches what we expect for the plan - only then do we grant access.
+    This is what makes it safe to auto-approve real money with no human check.
     """
     posted = request.form.to_dict()
 
@@ -243,21 +283,46 @@ def payfast_notify():
     ref_code = posted.get("custom_str2") or None
     payment_id = posted.get("pf_payment_id", "")
 
-    if payment_status == "COMPLETE" and email:
-        add_or_extend_subscription(email=email, plan=plan, payfast_payment_id=payment_id, referred_by_code=ref_code)
+    if payment_status != "COMPLETE" or not email:
+        return "OK", 200  # nothing to do - not a completed payment
+
+    if not verify_payfast_signature(posted, PAYFAST_PASSPHRASE):
+        print(f"REJECTED webhook for {email}: signature mismatch (possible tampering)")
+        return "Invalid signature", 400
+
+    posted_amount = None
+    if plan in ("daily", "monthly"):
         try:
-            invite_link = create_single_use_invite()
-            my_referral_code = get_or_create_referral_code(email)
-            my_referral_link = f"{YOUR_DOMAIN}/pay/daily?email=FRIEND_EMAIL&ref={my_referral_code}"
-            send_invite_email(
-                to_email=email,
-                invite_link=invite_link,
-                plan=plan,
-                referral_link=my_referral_link,
-            )
-            print(f"Subscriber {email} paid for {plan}. Invite emailed.")
-        except Exception as e:
-            print(f"Failed to create/send Telegram invite for {email}: {e}")
+            posted_amount = float(posted.get("amount_gross", posted.get("amount", 0)))
+            if abs(posted_amount - expected_amount_for_plan(plan)) > 0.01:
+                print(f"REJECTED webhook for {email}: amount mismatch (got {posted_amount}, expected {expected_amount_for_plan(plan)})")
+                return "Amount mismatch", 400
+        except (ValueError, TypeError):
+            print(f"REJECTED webhook for {email}: could not parse amount")
+            return "Invalid amount", 400
+
+    if not verify_with_payfast_server(posted):
+        print(f"REJECTED webhook for {email}: PayFast server validation failed")
+        return "Validation failed", 400
+
+    # All checks passed - genuinely confirmed by PayFast, safe to grant access
+    add_or_extend_subscription(
+        email=email, plan=plan, payfast_payment_id=payment_id,
+        referred_by_code=ref_code, amount=posted_amount,
+    )
+    try:
+        invite_link = create_single_use_invite()
+        my_referral_code = get_or_create_referral_code(email)
+        my_referral_link = f"{YOUR_DOMAIN}/pay/daily?email=FRIEND_EMAIL&ref={my_referral_code}"
+        send_invite_email(
+            to_email=email,
+            invite_link=invite_link,
+            plan=plan,
+            referral_link=my_referral_link,
+        )
+        print(f"Subscriber {email} paid for {plan}. Invite emailed.")
+    except Exception as e:
+        print(f"Failed to create/send Telegram invite for {email}: {e}")
 
     return "OK", 200
 
@@ -275,6 +340,42 @@ def my_referrals():
         "friends_referred": stats["referral_count"],
         "bonus_days_earned": stats["bonus_days_earned"],
     })
+
+
+@app.route("/admin/revenue")
+def admin_revenue():
+    """
+    Private revenue dashboard - see today's total and a 7-day breakdown.
+    Requires ADMIN_SECRET. Example: /admin/revenue?secret=YOUR_ADMIN_SECRET
+    """
+    secret = request.args.get("secret", "")
+    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        return "Not authorized - check your ADMIN_SECRET.", 403
+
+    today = get_revenue_today()
+    summary = get_revenue_summary(days=7)
+
+    by_plan_html = "".join(f"<li>{plan}: R{amt}</li>" for plan, amt in today["by_plan"].items())
+    rows_html = "".join(
+        f"<tr><td>{d['date']}</td><td>R{d['total']}</td><td>{d['count']}</td></tr>" for d in summary
+    )
+
+    return f"""
+    <html><body style="font-family: sans-serif; max-width: 600px; margin: 40px auto; line-height: 1.6;">
+        <h2>Revenue</h2>
+        <h3>Today ({today['date']})</h3>
+        <p style="font-size:1.8em;"><b>R{today['total_revenue']}</b></p>
+        <p>{today['payment_count']} payment(s) today</p>
+        <ul>{by_plan_html}</ul>
+        <h3>Last 7 Days</h3>
+        <table style="width:100%; border-collapse: collapse;">
+            <tr style="text-align:left; border-bottom: 2px solid #ccc;">
+                <th>Date</th><th>Total</th><th>Payments</th>
+            </tr>
+            {rows_html}
+        </table>
+    </body></html>
+    """
 
 
 @app.route("/performance")
