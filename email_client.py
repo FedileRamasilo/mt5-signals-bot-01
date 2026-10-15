@@ -42,9 +42,12 @@ def send_invite_email(to_email: str, invite_link: str, plan: str, referral_link:
             f"you get a free day added automatically:<br>{referral_link}</p>"
         )
 
+    access_duration = "12 hours" if plan == "daily" else "30 days"
+    renewal_note = " - you will need to pay again for your next 12-hour window" if plan == "daily" else ""
     html_body = (
-        f"<p>Thanks for subscribing to the {plan} plan!</p>"
-        f"<p>Join the private Telegram channel here (one-time use link):<br>"
+        f"<p>Thanks for subscribing to the {plan} plan! Your access is valid for <b>{access_duration}</b> "
+        f"from now{renewal_note}.</p>"
+        f"<p>Join the private Telegram channel here (one-time use link, valid for 12 hours):<br>"
         f"<a href='{invite_link}'>{invite_link}</a></p>"
         f"<p>Signals for BTC/USD, USD/CHF, Gold, and USD/ZAR will be posted there as they trigger.</p>"
         f"{referral_block}"
