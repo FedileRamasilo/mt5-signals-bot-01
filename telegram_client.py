@@ -91,7 +91,7 @@ def post_free_signal(signal: dict, subscribe_link: str):
     return resp.json()
 
 
-def create_single_use_invite(expire_seconds: int = 86400) -> str:
+def create_single_use_invite(expire_seconds: int = 43200) -> str:
     """Create a one-time invite link for a newly paid subscriber. Bot must be channel admin."""
     expire_timestamp = int(time.time()) + expire_seconds  # Telegram wants a Unix timestamp, not an offset
     resp = requests.post(
