@@ -113,7 +113,55 @@ def create_single_use_invite(expire_seconds: int = 43200) -> str:
     return resp.json()["result"]["invite_link"]
 
 
-def remove_subscriber(telegram_user_id: int):
-    """Kick + immediately unban so an expired subscriber can rejoin after re-paying."""
-    requests.post(f"{API_BASE}/banChatMember", json={"chat_id": CHANNEL_ID, "user_id": telegram_user_id}, timeout=15)
-    requests.post(f"{API_BASE}/unbanChatMember", json={"chat_id": CHANNEL_ID, "user_id": telegram_user_id}, timeout=15)
+def remove_subscriber(telegram_user_id: int) -> bool:
+    """Kick + immediately unban so an expired subscriber can rejoin after re-paying.
+    Returns True only if Telegram confirmed the removal."""
+    ban = requests.post(f"{API_BASE}/banChatMember", json={"chat_id": CHANNEL_ID, "user_id": telegram_user_id}, timeout=15)
+    if not ban.ok:
+        return False
+    requests.post(f"{API_BASE}/unbanChatMember", json={"chat_id": CHANNEL_ID, "user_id": telegram_user_id, "only_if_banned": True}, timeout=15)
+    return True
+
+
+# --- Join tracking: learn WHO joined with WHICH one-time link ---------------
+_update_offset = None
+
+
+def parse_member_joins(updates: list, channel_id) -> list:
+    """Pure function: pick out 'someone joined our channel' events from Telegram updates."""
+    joins = []
+    for upd in updates:
+        cm = upd.get("chat_member")
+        if not cm:
+            continue
+        if str(cm.get("chat", {}).get("id")) != str(channel_id):
+            continue
+        new = cm.get("new_chat_member", {})
+        old = cm.get("old_chat_member", {})
+        if new.get("status") != "member" or old.get("status") not in ("left", "kicked", None):
+            continue
+        user = new.get("user", {})
+        if user.get("is_bot"):
+            continue
+        link = (cm.get("invite_link") or {}).get("invite_link")
+        joins.append({"user_id": user.get("id"), "invite_link": link})
+    return joins
+
+
+def fetch_member_joins() -> list:
+    """Poll Telegram for new join events (needs the bot to be a channel admin)."""
+    global _update_offset
+    body = {"timeout": 0, "allowed_updates": ["chat_member"]}
+    if _update_offset is not None:
+        body["offset"] = _update_offset
+    resp = requests.post(f"{API_BASE}/getUpdates", json=body, timeout=20)
+    if not resp.ok:
+        try:
+            detail = resp.json().get("description", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Telegram getUpdates failed (status {resp.status_code}): {detail}")
+    updates = resp.json().get("result", [])
+    if updates:
+        _update_offset = max(u["update_id"] for u in updates) + 1
+    return parse_member_joins(updates, CHANNEL_ID)
