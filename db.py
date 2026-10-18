@@ -35,17 +35,38 @@ def init_db():
             created_at TEXT,
             referral_code TEXT UNIQUE,     -- this subscriber's own code to share
             referred_by_code TEXT,         -- code of whoever referred them, if any
-            amount REAL                    -- what they actually paid, for revenue tracking
+            amount REAL,                   -- what they actually paid, for revenue tracking
+            invite_link TEXT,              -- the one-time Telegram link issued when the personal link is used
+            access_token TEXT,             -- secret part of this payment's personal /join/<token> link
+            redeemed_at TEXT               -- set the first time the personal link is used
         )
         """
     )
     # Safe migration: adds the 'amount' column if the table already existed
     # without it (e.g. persistent storage from before this change).
-    try:
-        conn.execute("ALTER TABLE subscribers ADD COLUMN amount REAL")
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    for ddl in ("ALTER TABLE subscribers ADD COLUMN amount REAL",
+                "ALTER TABLE subscribers ADD COLUMN invite_link TEXT",
+                "ALTER TABLE subscribers ADD COLUMN access_token TEXT",
+                "ALTER TABLE subscribers ADD COLUMN redeemed_at TEXT"):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payment_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact TEXT,
+            plan TEXT,
+            amount REAL,
+            reference TEXT,
+            ref_code TEXT,
+            status TEXT DEFAULT 'pending',   -- 'pending' until you approve
+            created_at TEXT
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS referral_bonuses (
@@ -132,11 +153,11 @@ def add_or_extend_subscription(
         """
         INSERT INTO subscribers
             (email, telegram_user_id, plan, payfast_payment_id, expires_at, created_at,
-             referral_code, referred_by_code, amount)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             referral_code, referred_by_code, amount, access_token)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (email, telegram_user_id, plan, payfast_payment_id, expires_at.isoformat(), now.isoformat(),
-         code_for_this_row, referred_by_code, amount),
+         code_for_this_row, referred_by_code, amount, secrets.token_urlsafe(9)),
     )
     conn.commit()
     conn.close()
@@ -185,12 +206,75 @@ def get_referral_stats(email: str) -> dict:
     return {"referral_count": row["c"], "bonus_days_earned": row["days"]}
 
 
+def attach_invite_link(email: str, invite_link: str):
+    """Remember which one-time link was issued for this person's latest payment."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE subscribers SET invite_link = ? WHERE id = "
+        "(SELECT id FROM subscribers WHERE email = ? ORDER BY id DESC LIMIT 1)",
+        (invite_link, email),
+    )
+    conn.commit()
+    conn.close()
+
+
+def link_telegram_user(invite_link: str, telegram_user_id: int) -> str | None:
+    """Called when Telegram reports someone joined via one of our links.
+    Saves their Telegram ID against that subscriber's email. Returns the email,
+    or None if the link isn't one we issued (i.e. a join we can't match to a payment)."""
+    conn = get_conn()
+    row = conn.execute("SELECT email FROM subscribers WHERE invite_link = ? LIMIT 1", (invite_link,)).fetchone()
+    if not row:
+        conn.close()
+        return None
+    conn.execute("UPDATE subscribers SET telegram_user_id = ? WHERE email = ?", (telegram_user_id, row["email"]))
+    conn.commit()
+    conn.close()
+    return row["email"]
+
+
 def get_expired_subscribers() -> list:
+    """People whose LATEST payment has run out and who are known to be in the channel.
+    Grouped per email so a renewal protects them from being removed by an older, expired row."""
     conn = get_conn()
     now = datetime.utcnow().isoformat()
     rows = conn.execute(
-        "SELECT * FROM subscribers WHERE expires_at < ? AND telegram_user_id IS NOT NULL",
+        "SELECT email, MAX(telegram_user_id) AS telegram_user_id, MAX(expires_at) AS last_expiry "
+        "FROM subscribers GROUP BY email "
+        "HAVING MAX(expires_at) < ? AND MAX(telegram_user_id) IS NOT NULL",
         (now,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def clear_telegram_user(email: str):
+    """After removing someone, forget their ID so we don't try again; a new join re-links them."""
+    conn = get_conn()
+    conn.execute("UPDATE subscribers SET telegram_user_id = NULL WHERE email = ?", (email,))
+    conn.commit()
+    conn.close()
+
+
+def recent_signal_exists(symbol: str, direction: str, minutes: int = 30) -> bool:
+    """Guards against posting the same signal twice (e.g. after a restart)."""
+    conn = get_conn()
+    cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+    row = conn.execute(
+        "SELECT 1 FROM signals WHERE symbol = ? AND direction = ? AND posted_at >= ? LIMIT 1",
+        (symbol, direction, cutoff),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_members_overview() -> list:
+    """One row per person: latest plan, when access ends, and whether they've joined the channel."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT s.email AS email, MAX(s.expires_at) AS expires_at, MAX(s.telegram_user_id) AS telegram_user_id, "
+        "(SELECT plan FROM subscribers x WHERE x.email = s.email ORDER BY x.id DESC LIMIT 1) AS plan "
+        "FROM subscribers s GROUP BY s.email ORDER BY MAX(s.expires_at) DESC"
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -311,3 +395,82 @@ def get_revenue_summary(days: int = 7) -> list:
 
     return sorted(by_day.values(), key=lambda d: d["date"], reverse=True)
 
+
+
+# --- Personal access links: /join/<token> -----------------------------------
+
+def get_latest_subscription(contact: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM subscribers WHERE email = ? ORDER BY id DESC LIMIT 1", (contact,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_subscription_by_token(token: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM subscribers WHERE access_token = ? LIMIT 1", (token,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def claim_token(token: str) -> bool:
+    """Mark the personal link as used. Only the FIRST caller gets True (guards against two simultaneous clicks)."""
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE subscribers SET redeemed_at = ? WHERE access_token = ? AND redeemed_at IS NULL",
+        (datetime.utcnow().isoformat(), token),
+    )
+    conn.commit()
+    ok = cur.rowcount == 1
+    conn.close()
+    return ok
+
+
+def release_token(token: str):
+    conn = get_conn()
+    conn.execute("UPDATE subscribers SET redeemed_at = NULL WHERE access_token = ?", (token,))
+    conn.commit()
+    conn.close()
+
+
+def store_invite_link(token: str, invite_link: str):
+    conn = get_conn()
+    conn.execute("UPDATE subscribers SET invite_link = ? WHERE access_token = ?", (invite_link, token))
+    conn.commit()
+    conn.close()
+
+
+# --- People who asked to pay (shown on /admin/pending) ----------------------
+
+def log_payment_request(contact: str, plan: str, ref_code, reference: str, amount: float):
+    conn = get_conn()
+    cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    dup = conn.execute(
+        "SELECT 1 FROM payment_requests WHERE contact = ? AND plan = ? AND status = 'pending' AND created_at >= ? LIMIT 1",
+        (contact, plan, cutoff),
+    ).fetchone()
+    if not dup:
+        conn.execute(
+            "INSERT INTO payment_requests (contact, plan, amount, reference, ref_code, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (contact, plan, amount, reference, ref_code, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    conn.close()
+
+
+def get_pending_requests() -> list:
+    conn = get_conn()
+    cutoff = (datetime.utcnow() - timedelta(days=3)).isoformat()
+    rows = conn.execute(
+        "SELECT * FROM payment_requests WHERE status = 'pending' AND created_at >= ? ORDER BY id DESC", (cutoff,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def mark_requests_approved(contact: str):
+    conn = get_conn()
+    conn.execute("UPDATE payment_requests SET status = 'approved' WHERE contact = ? AND status = 'pending'", (contact,))
+    conn.commit()
+    conn.close()
