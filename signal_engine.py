@@ -68,9 +68,9 @@ def generate_signal(symbol_key: str, df: pd.DataFrame) -> dict | None:
     return {
         "symbol": symbol_key,
         "direction": direction,
-        "entry": round(entry, 4),
-        "sl": round(sl, 4),
-        "tp": round(tp, 4),
-        "rsi": round(last["rsi"], 1),
+        "entry": float(round(entry, 4)),
+        "sl": float(round(sl, 4)),
+        "tp": float(round(tp, 4)),
+        "rsi": float(round(last["rsi"], 1)),
         "timestamp": str(last["datetime"]),
     }
