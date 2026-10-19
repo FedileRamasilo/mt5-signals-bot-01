@@ -1,0 +1,5 @@
+# Keep local secrets out of GitHub
+.env
+.env.*
+!.env.example
+!.env.paystack.example
