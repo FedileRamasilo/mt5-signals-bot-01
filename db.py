@@ -69,6 +69,23 @@ def init_db():
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS card_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reference TEXT UNIQUE,
+            contact TEXT,
+            email TEXT,
+            plan TEXT,
+            amount REAL,
+            ref_code TEXT,
+            status TEXT DEFAULT 'pending',   -- 'pending' until Paystack confirms, then 'paid'
+            access_token TEXT,               -- the personal /join/<token> created for this payment
+            created_at TEXT,
+            paid_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS referral_bonuses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             referrer_email TEXT,
@@ -273,7 +290,9 @@ def get_members_overview() -> list:
     conn = get_conn()
     rows = conn.execute(
         "SELECT s.email AS email, MAX(s.expires_at) AS expires_at, MAX(s.telegram_user_id) AS telegram_user_id, "
-        "(SELECT plan FROM subscribers x WHERE x.email = s.email ORDER BY x.id DESC LIMIT 1) AS plan "
+        "(SELECT plan FROM subscribers x WHERE x.email = s.email ORDER BY x.id DESC LIMIT 1) AS plan, "
+        "(SELECT access_token FROM subscribers x WHERE x.email = s.email ORDER BY x.id DESC LIMIT 1) AS latest_token, "
+        "(SELECT redeemed_at FROM subscribers x WHERE x.email = s.email ORDER BY x.id DESC LIMIT 1) AS latest_redeemed "
         "FROM subscribers s GROUP BY s.email ORDER BY MAX(s.expires_at) DESC"
     ).fetchall()
     conn.close()
@@ -472,5 +491,53 @@ def get_pending_requests() -> list:
 def mark_requests_approved(contact: str):
     conn = get_conn()
     conn.execute("UPDATE payment_requests SET status = 'approved' WHERE contact = ? AND status = 'pending'", (contact,))
+    conn.commit()
+    conn.close()
+
+
+# --- Card payments (Paystack) ------------------------------------------------
+
+def create_card_payment(reference: str, contact: str, email: str, plan: str, amount: float, ref_code):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO card_payments (reference, contact, email, plan, amount, ref_code, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+        (reference, contact, email, plan, amount, ref_code, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_card_payment(reference: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM card_payments WHERE reference = ?", (reference,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def claim_card_payment(reference: str) -> bool:
+    """Only the FIRST caller (return page or webhook) gets True, so a payment is never fulfilled twice."""
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE card_payments SET status = 'paid', paid_at = ? WHERE reference = ? AND status = 'pending'",
+        (datetime.utcnow().isoformat(), reference),
+    )
+    conn.commit()
+    ok = cur.rowcount == 1
+    conn.close()
+    return ok
+
+
+def release_card_payment(reference: str):
+    """Put a payment back to 'pending' if fulfilling it failed part-way, so it can be retried."""
+    conn = get_conn()
+    conn.execute("UPDATE card_payments SET status = 'pending', paid_at = NULL WHERE reference = ?", (reference,))
+    conn.commit()
+    conn.close()
+
+
+def set_card_payment_token(reference: str, token: str):
+    conn = get_conn()
+    conn.execute("UPDATE card_payments SET access_token = ? WHERE reference = ?", (token, reference))
     conn.commit()
     conn.close()
