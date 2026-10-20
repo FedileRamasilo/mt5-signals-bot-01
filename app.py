@@ -11,6 +11,8 @@ PayFast requires the notify_url to be publicly reachable.
 
 import os
 import re
+import secrets
+import logging
 import hashlib
 import urllib.parse
 import requests
@@ -37,6 +39,17 @@ from db import (
     log_payment_request,
     get_pending_requests,
     mark_requests_approved,
+    create_card_payment,
+    get_card_payment,
+    claim_card_payment,
+    release_card_payment,
+    set_card_payment_token,
+)
+from paystack_client import (
+    initialize_transaction,
+    verify_transaction,
+    verify_webhook_signature,
+    is_enabled as paystack_enabled,
 )
 from telegram_client import create_single_use_invite, post_signal
 from email_client import send_invite_email
@@ -578,9 +591,25 @@ def admin_revenue():
 @app.route("/subscribe")
 def subscribe():
     """One generic link for ALL your advertising: the visitor types their WhatsApp number and
-    is taken to the bank-transfer page with their own reference."""
-    err = '<p style="color:#c00;">Please enter a valid WhatsApp number, e.g. 082 123 4567</p>' if request.args.get("error") else ""
+    pays - by card/instant payment (if Paystack is switched on) or by bank transfer."""
+    errors = {
+        "1": "Please enter a valid WhatsApp number, e.g. 082 123 4567",
+        "2": "For card payment please also enter a valid email address.",
+    }
+    err = f'<p style="color:#c00;">{errors[request.args.get("error")]}</p>' if request.args.get("error") in errors else ""
     ref = escape(request.args.get("ref", ""))
+    card = paystack_enabled()
+    email_field = (
+        '<p><label>Your email (for your card receipt)<br>'
+        '<input type="email" name="email" placeholder="you@example.com" style="width:100%; padding:10px; font-size:1em;"></label></p>'
+        if card else ""
+    )
+    card_button = (
+        f'<button type="submit" name="method" value="card" style="{BUTTON_STYLE} border:0; width:100%; margin-bottom:10px;">'
+        f'Pay now - card / instant</button>'
+        if card else ""
+    )
+    eft_style = "padding:12px 18px; font-size:1em; width:100%;" if card else "padding:12px 20px; font-size:1em;"
     return f"""
     <html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
     <body style="{PAGE_STYLE}">
@@ -591,12 +620,14 @@ def subscribe():
             <input type="hidden" name="ref" value="{ref}">
             <p><label>Your WhatsApp number<br>
             <input type="tel" name="contact" placeholder="082 123 4567" required style="width:100%; padding:10px; font-size:1em;"></label></p>
+            {email_field}
             <p><label>Plan<br>
             <select name="plan" style="width:100%; padding:10px; font-size:1em;">
                 <option value="daily">12 hours - R{DAILY_PRICE}</option>
                 <option value="monthly">30 days - R{MONTHLY_PRICE}</option>
             </select></label></p>
-            <button type="submit" style="padding:12px 20px; font-size:1em;">Continue to payment</button>
+            {card_button}
+            <button type="submit" name="method" value="eft" style="{eft_style}">Pay by bank transfer</button>
         </form>
         <p style="color:#666;font-size:0.9em;">See our real results first: <a href="/performance">track record</a></p>
     </body></html>
@@ -607,14 +638,138 @@ def subscribe():
 def subscribe_go():
     contact = normalize_contact(request.args.get("contact"))
     plan = request.args.get("plan", "daily")
-    if not contact:
+    method = request.args.get("method", "eft")
+    if not contact or "@" in contact:
         return redirect("/subscribe?error=1")
     if plan not in ("daily", "monthly"):
         plan = "daily"
     params = {"contact": contact}
     if request.args.get("ref"):
         params["ref"] = request.args.get("ref")
+    if method == "card" and paystack_enabled():
+        email = normalize_contact(request.args.get("email"))
+        if not email or "@" not in email:
+            return redirect("/subscribe?error=2")
+        params["email"] = email
+        return redirect(f"/pay-card/{plan}?{urllib.parse.urlencode(params)}")
     return redirect(f"/pay-eft/{plan}?{urllib.parse.urlencode(params)}")
+
+
+# --- Card / instant payments through Paystack ---------------------------------
+
+def fulfil_card_payment(reference):
+    """Turn a PAID Paystack payment into access. Safe to call many times (return page AND webhook both call it):
+    returns ("ok", token, expires_at), ("pending", None, None) or ("failed", None, None)."""
+    rec = get_card_payment(reference) if reference else None
+    if not rec:
+        return "failed", None, None
+    if rec["status"] == "paid":
+        if rec["access_token"]:
+            sub = get_subscription_by_token(rec["access_token"])
+            return "ok", rec["access_token"], datetime.fromisoformat(sub["expires_at"])
+        return "pending", None, None            # the other request is still finishing it
+
+    try:
+        data = verify_transaction(reference)   # ask Paystack directly - never trust the browser or the request alone
+    except Exception as e:
+        logging.error(f"Paystack verify failed for {reference}: {e}")
+        return "pending", None, None
+    status = data.get("status")
+    if status != "success":
+        return ("pending" if status in ("pending", "ongoing", "processing", "queued") else "failed"), None, None
+    if data.get("amount") != int(round(rec["amount"] * 100)) or (data.get("currency") or "").upper() != "ZAR":
+        logging.error(f"Paystack amount/currency mismatch for {reference}: {data.get('amount')} {data.get('currency')}")
+        return "failed", None, None
+
+    if not claim_card_payment(reference):
+        return "pending", None, None
+    try:
+        expires_at = add_or_extend_subscription(
+            email=rec["contact"], plan=rec["plan"], payfast_payment_id=f"paystack:{reference}",
+            referred_by_code=rec["ref_code"], amount=rec["amount"],
+        )
+        token = get_latest_subscription(rec["contact"])["access_token"]
+        set_card_payment_token(reference, token)
+        mark_requests_approved(rec["contact"])
+    except Exception:
+        release_card_payment(reference)
+        raise
+    return "ok", token, expires_at
+
+
+@app.route("/pay-card/<plan>")
+def pay_card(plan):
+    contact = normalize_contact(request.args.get("contact"))
+    email = normalize_contact(request.args.get("email"))
+    ref_code = request.args.get("ref") or None
+    if plan not in ("daily", "monthly"):
+        return "Invalid plan", 400
+    if not contact or "@" in contact:
+        return redirect("/subscribe?error=1")
+    if not paystack_enabled():
+        return redirect(f"/pay-eft/{plan}?{urllib.parse.urlencode({'contact': contact})}")
+    if not email or "@" not in email:
+        return redirect("/subscribe?error=2")
+
+    amount = expected_amount_for_plan(plan)
+    reference = f"SIG-{secrets.token_hex(8)}"
+    create_card_payment(reference, contact, email, plan, amount, ref_code)
+    try:
+        checkout_url = initialize_transaction(
+            email=email, amount_rand=amount, reference=reference,
+            callback_url=f"{YOUR_DOMAIN}/paystack/return",
+            metadata={"whatsapp": contact, "plan": plan},
+        )
+    except Exception as e:
+        logging.error(f"Could not start Paystack payment: {e}")
+        eft = f"/pay-eft/{plan}?{urllib.parse.urlencode({'contact': contact})}"
+        return gate_page("We could not start the card payment just now. You can pay by bank transfer instead: "
+                         f"{YOUR_DOMAIN}{eft}", 503)
+    return redirect(checkout_url)
+
+
+@app.route("/paystack/return")
+def paystack_return():
+    """Where Paystack sends the customer after paying. We re-check with Paystack before giving access."""
+    reference = request.args.get("reference") or request.args.get("trxref")
+    status, token, expires_at = fulfil_card_payment(reference)
+    head = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1">'
+    if status == "ok":
+        link = f"{YOUR_DOMAIN}/join/{token}"
+        return f"""{head}</head><body style="{PAGE_STYLE}">
+            <h2>Payment received - thank you!</h2>
+            <p>Your access runs until <b>{sast(expires_at)} SAST</b>.</p>
+            <p><a style="{BUTTON_STYLE}" href="/join/{escape(token)}">Join the private channel</a></p>
+            <p style="color:#666;font-size:0.9em;">Open this on the phone that has Telegram. Your personal link works for
+            ONE person only - save it if you need it again:<br><span style="word-break:break-all;">{escape(link)}</span></p>
+        </body></html>"""
+    if status == "pending":
+        return f"""{head}<meta http-equiv="refresh" content="4"></head><body style="{PAGE_STYLE}">
+            <h2>Confirming your payment...</h2><p>This page refreshes by itself. Please wait a few seconds.</p>
+        </body></html>"""
+    wa = f'<p><a style="{BUTTON_STYLE}" href="https://wa.me/{ADMIN_WHATSAPP}">Message us on WhatsApp</a></p>' if ADMIN_WHATSAPP else ""
+    return f"""{head}</head><body style="{PAGE_STYLE}">
+        <h2>We could not confirm this payment</h2>
+        <p>If money left your account, please message us with your reference <b>{escape(reference or '')}</b> and we will sort it out straight away.</p>
+        {wa}<p><a href="/subscribe">Try again</a></p>
+    </body></html>""", 402
+
+
+@app.route("/paystack/webhook", methods=["POST"])
+def paystack_webhook():
+    """Paystack calls this when a payment succeeds - even if the customer closed their browser first."""
+    if not verify_webhook_signature(request.get_data(), request.headers.get("x-paystack-signature", "")):
+        return "Invalid signature", 400
+    event = request.get_json(force=True, silent=True) or {}   # read the body even if not labelled as JSON
+    if event.get("event") == "charge.success":
+        try:
+            status, _, _ = fulfil_card_payment((event.get("data") or {}).get("reference"))
+        except Exception:
+            logging.exception("Paystack webhook fulfilment failed")
+            return "Error", 500
+        if status == "pending":
+            return "Retry later", 500    # a non-200 answer makes Paystack send the webhook again later
+    return "OK", 200
 
 
 @app.route("/admin/members")
@@ -646,7 +801,15 @@ def admin_members():
         else:
             text = f"Hi! Your signals access has ended. Renew here to get your new personal link: {renew_link}"
         wa = whatsapp_url(m["email"], text)
-        remind = f"<a href='{escape(wa)}'>Remind</a>" if wa else "-"
+        actions = []
+        if active and m.get("latest_token") and not m.get("latest_redeemed") and is_phone(m["email"]):
+            link = f"{YOUR_DOMAIN}/join/{m['latest_token']}"
+            msg = build_access_message(link, datetime.fromisoformat(m["expires_at"]), plan, get_or_create_referral_code(m["email"]))
+            send = whatsapp_url(m["email"], msg)
+            actions.append(f"<a href='{escape(send)}'><b>Send link</b></a>")
+        if wa:
+            actions.append(f"<a href='{escape(wa)}'>Remind</a>")
+        remind = " | ".join(actions) if actions else "-"
         rows_html += (
             f"<tr><td>{escape(m['email'])}</td><td>{escape(plan)}</td>"
             f"<td style='color:{'green' if active else '#c00'}'>{'ACTIVE' if active else 'expired'}</td>"
@@ -665,7 +828,7 @@ def admin_members():
         <p><a href="/admin/pending?secret={escape(secret)}">Waiting for payment</a></p>
         <table style="width:100%; border-collapse: collapse;">
             <tr style="text-align:left; border-bottom: 2px solid #ccc;">
-                <th>WhatsApp</th><th>Plan</th><th>Status</th><th>Access ends (SAST)</th><th>Joined</th><th>Renewal reminder</th>
+                <th>WhatsApp</th><th>Plan</th><th>Status</th><th>Access ends (SAST)</th><th>Joined</th><th>Actions</th>
             </tr>
             {rows_html}
         </table>
