@@ -1,8 +1,88 @@
 # MT5-Style Signals Subscription Bot
 
-Delivers BTC/USD, USD/CHF, and Gold (XAU/USD) trade signals to a private
+Delivers BTC/USD, USD/CHF, Gold (XAU/USD), and USD/ZAR trade signals to a private
 Telegram channel, gated by PayFast subscription payments (daily R100 /
 monthly R1500, adjust in `.env`).
+
+## IMPORTANT: run ONE service (not web + worker)
+
+Two separate Railway services cannot share a database file, so signals logged by
+a worker never reached the website, and expired people were never removed.
+The signal/expiry jobs now run inside the web service (`python app.py`).
+- Delete the old "worker" service in Railway.
+- Add a Volume to the web service mounted at `/data` and set
+  `DATABASE_PATH=/data/subscribers.db`, so redeploys don't wipe your records.
+- The web service needs ALL variables (TwelveData, Telegram, Brevo, bank details...).
+
+## Paystack: automatic card / instant payments (optional)
+
+Set `PAYSTACK_SECRET_KEY` and `/subscribe` shows a **Pay now - card / instant** button next to
+bank transfer. After they pay, they land on a page with their personal join link straight away -
+no approving or WhatsApp step from you. Bank transfer keeps working exactly as before.
+
+- Every payment is double-checked with Paystack (amount, currency, paid) before access is given.
+- If a customer pays and closes the page, Paystack's webhook still grants access; `/admin/members`
+  then shows a **Send link** WhatsApp button for them.
+- Test with your TEST key first, then swap in the LIVE key.
+- Webhook URL to set in the Paystack dashboard: `https://YOUR-DOMAIN/paystack/webhook`
+
+## How selling works now (WhatsApp, personal one-use links)
+
+1. Advertise ONE link everywhere: `/subscribe`. The visitor types their WhatsApp number and gets
+   the bank-transfer page with their own reference. They also appear on `/admin/pending`.
+2. You see the payment in your bank app, open `/admin/pending`, tap **Approve**.
+3. The approve page has a **Send on WhatsApp** button: WhatsApp opens with the message and the
+   subscriber's personal link already written. You just tap send.
+4. The personal link (`/join/<token>`) works for ONE person, once. The first person to open it
+   gets a one-time Telegram join button. If it is forwarded, anyone else who opens it is sent to pay.
+5. When the 12 hours end the bot removes them and the old link is dead. To renew they pay again
+   and you approve again - they get a NEW link. `/admin/members` has a one-tap WhatsApp "Remind" button.
+
+Admin pages (all need `?secret=YOUR_ADMIN_SECRET`):
+- `/admin/pending` - who is waiting for you to confirm payment
+- `/admin/approve?contact=27821234567&plan=daily` - approve (the Pending page links here)
+- `/admin/members` - active/expired, who has joined, are the background jobs alive
+- `/admin/revenue` - what you made today and over 7 days
+- `/admin/test-signal?symbol=BTC` - preview a signal in your channel
+
+Note: the 12 hours start when YOU approve, so approve and send promptly.
+
+## New: 12-hour access periods (was 24 hours)
+
+The "daily" plan now grants 12 hours of access instead of 24 - subscribers
+pay twice a day instead of once. `DAILY_PRICE` is now the price per
+12-hour period (e.g. R150 twice a day = R300/day total, same as before).
+The Telegram invite link itself also now expires after 12 hours if unused,
+matching the new access window.
+
+Note: this roughly doubles how often you (or PayFast, once fully wired up)
+need to process a payment per subscriber - worth knowing since it affects
+your admin workload with manual EFT approvals.
+
+## New: Revenue dashboard
+
+See exactly how much you've made, broken down by day and plan. Visit
+`/admin/revenue?secret=YOUR_ADMIN_SECRET` for today's total plus a 7-day
+history. Every approved payment (EFT or PayFast) now records its amount
+automatically.
+
+## New: Public performance dashboard (real, auto-tracked win rate)
+
+Every signal posted gets logged, and a background job checks live prices
+every 15 minutes to see if TP or SL has been hit - recording each signal
+as a win or loss automatically, no manual tracking needed.
+
+Visit `/performance` for a public page showing total signals, wins,
+losses, win rate, and a table of recent signals with their outcomes.
+
+This is worth linking to from your marketing/sales messages - a real,
+unfiltered track record (including losses) is the single biggest thing
+that separates a trustworthy signals service from the anonymous channels
+that dominate this market. Share it as: `https://your-domain/performance`
+
+Also added: `/admin/test-signal?secret=YOUR_ADMIN_SECRET&symbol=BTC` posts
+a sample signal to your private channel immediately, so you can check the
+formatting without waiting for a real EMA/RSI crossover to trigger.
 
 ## New: Manual bank transfer (launch today, before PayFast is fully working)
 
@@ -115,12 +195,21 @@ unverifiable signal channels.
 
 ## What you still need to do before taking real money
 
-- **Email delivery**: now wired up via SMTP in `email_client.py` â€” if using
-  Gmail, you'll need to generate an "App Password" (Google Account â†’
-  Security â†’ 2-Step Verification â†’ App Passwords), not your normal password.
-- **PayFast ITN validation**: PayFast's docs require you to also verify the
-  notification against their validate endpoint and check the source IP, not
-  just trust the POST body. See PayFast's ITN documentation before going live.
+- **Email delivery**: uses Brevo's HTTPS API in `email_client.py`, not SMTP.
+  Railway (and most hosts on free/hobby plans) block outbound SMTP entirely
+  to prevent spam abuse - no SMTP config would ever work there, regardless
+  of credentials. Sign up free at brevo.com (300 emails/day free), verify
+  your account, generate an API key under SMTP & API > API Keys, and set
+  BREVO_API_KEY and FROM_EMAIL in your `.env` / Railway variables.
+- **PayFast ITN validation**: now implemented in `/payfast/notify` - it
+  verifies the signature (catches tampering), checks the paid amount matches
+  the plan price (catches manipulated amounts), and confirms with PayFast's
+  own validate endpoint that the notification is genuine, before granting
+  any access. This means you no longer need `/admin/approve` for PayFast
+  payments specifically - they auto-approve safely. (Source IP checking is
+  the one extra layer PayFast's docs also suggest, not added here since
+  Railway's outbound IPs aren't fixed - the three checks above cover the
+  practical risk.)
 - **Strategy validation**: the EMA/RSI crossover in `signal_engine.py` is a
   starting template, not a backtested edge â€” paper trade it for a couple of
   weeks against your own judgment before charging people for it.
