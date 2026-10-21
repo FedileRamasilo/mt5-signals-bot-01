@@ -14,6 +14,21 @@ The signal/expiry jobs now run inside the web service (`python app.py`).
   `DATABASE_PATH=/data/subscribers.db`, so redeploys don't wipe your records.
 - The web service needs ALL variables (TwelveData, Telegram, Brevo, bank details...).
 
+## Subscriber website (no WhatsApp or Telegram needed)
+
+Send people to `/signup`. They enter their email, pay by card/instant (Paystack) or bank transfer,
+and view their signals on `/signals` - the open signals with entry / stop-loss / take-profit, recently
+closed ones with WIN/LOSS, and a live countdown of their paid time. The page refreshes itself.
+
+- **Signing in:** right after a card payment they are signed in automatically (once). After that they
+  enter their email on `/login` and get a one-tap link (no passwords). Links work once and expire.
+- **Bank transfer:** you approve as usual; the approve page emails them a sign-in link and also shows it
+  to you. `/admin/login-link?contact=their@email&secret=...` makes a fresh link if an email never arrives.
+- **Protection:** signals are hidden the moment paid time ends (they see a Renew button instead);
+  a login works on at most `MAX_DEVICES` devices (default 2) so one login can't be handed round a group.
+- **Telegram** is just an optional button on the dashboard.
+- Needs `FLASK_SECRET_KEY` (long random value) and Brevo (`BREVO_API_KEY`, `FROM_EMAIL`) for the emails.
+
 ## Paystack: automatic card / instant payments (optional)
 
 Set `PAYSTACK_SECRET_KEY` and `/subscribe` shows a **Pay now - card / instant** button next to
