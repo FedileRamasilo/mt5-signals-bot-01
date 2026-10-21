@@ -16,7 +16,7 @@ import logging
 import hashlib
 import urllib.parse
 import requests
-from flask import Flask, request, redirect, jsonify, make_response
+from flask import Flask, request, redirect, jsonify, make_response, session
 from datetime import datetime, timedelta
 from html import escape
 from dotenv import load_dotenv
@@ -44,7 +44,12 @@ from db import (
     claim_card_payment,
     release_card_payment,
     set_card_payment_token,
+    claim_web_session,
+    create_login_token,
+    create_member_session,
 )
+import members
+from email_client import send_login_email
 from paystack_client import (
     initialize_transaction,
     verify_transaction,
@@ -58,6 +63,14 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev")
+if app.secret_key == "dev":
+    logging.warning("FLASK_SECRET_KEY is not set - set a long random value in Railway for the subscriber website.")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("PUBLIC_DOMAIN", "").startswith("https://"),
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+)
 init_db()  # ensure tables exist regardless of how the app is started
 
 PAYFAST_MERCHANT_ID = os.getenv("PAYFAST_MERCHANT_ID")
@@ -355,15 +368,20 @@ def admin_approve():
         token = get_latest_subscription(contact)["access_token"]
     mark_requests_approved(contact)
 
-    link = f"{YOUR_DOMAIN}/join/{token}"
-    message = build_access_message(link, expires_at, plan, get_or_create_referral_code(contact))
-    wa = whatsapp_url(contact, message)
-
     email_note = ""
-    if not is_phone(contact):
+    if is_phone(contact):
+        link = f"{YOUR_DOMAIN}/join/{token}"
+        message = build_access_message(link, expires_at, plan, get_or_create_referral_code(contact))
+        wa = whatsapp_url(contact, message)
+    else:
+        # Website subscriber: give them a one-tap sign-in link (valid 24h) and email it.
+        link = f"{YOUR_DOMAIN}/login/{create_login_token(contact, minutes=1440)}"
+        message = (f"Your signals access is active until {sast(expires_at)} SAST.\n\nSign in to your dashboard: {link}\n\n"
+                   f"(The link works once for 24 hours. After that go to {YOUR_DOMAIN}/login and enter your email.)")
+        wa = None
         try:
-            send_invite_email(to_email=contact, invite_link=link, plan=plan)
-            email_note = "<p>Email sent.</p>"
+            send_login_email(contact, link, valid_for="24 hours", welcome=True)
+            email_note = "<p>Sign-in link emailed to them.</p>"
         except Exception as e:
             email_note = f"<p>Email FAILED ({escape(str(e))}) - send the message below yourself.</p>"
 
@@ -375,7 +393,7 @@ def admin_approve():
         <p><b>{escape(contact)}</b> - {escape(plan)} plan, R{paid_amount:g}<br>
         Access ends: <b>{sast(expires_at)} SAST</b></p>
         {wa_button}{email_note}
-        <p>Or copy this message:</p>
+        <p>Message you can copy:</p>
         <textarea readonly rows="9" style="width:100%; font-size:0.95em;">{escape(message)}</textarea>
         <p style="color:#666;font-size:0.9em;">The personal link works for ONE person, once. If it is forwarded, the next person is sent to pay.</p>
     </body></html>
@@ -629,7 +647,8 @@ def subscribe():
             {card_button}
             <button type="submit" name="method" value="eft" style="{eft_style}">Pay by bank transfer</button>
         </form>
-        <p style="color:#666;font-size:0.9em;">See our real results first: <a href="/performance">track record</a></p>
+        <p style="color:#666;font-size:0.9em;">Prefer a website instead of WhatsApp/Telegram? <a href="/signup">Get access here</a>.<br>
+        See our real results first: <a href="/performance">track record</a></p>
     </body></html>
     """
 
@@ -697,6 +716,25 @@ def fulfil_card_payment(reference):
     return "ok", token, expires_at
 
 
+def start_card_checkout(contact, email, plan, ref_code, flow="link"):
+    """Create the payment record, send the customer to Paystack's checkout page."""
+    amount = expected_amount_for_plan(plan)
+    reference = f"SIG-{secrets.token_hex(8)}"
+    create_card_payment(reference, contact, email, plan, amount, ref_code, flow)
+    try:
+        checkout_url = initialize_transaction(
+            email=email, amount_rand=amount, reference=reference,
+            callback_url=f"{YOUR_DOMAIN}/paystack/return",
+            metadata={"contact": contact, "plan": plan, "flow": flow},
+        )
+    except Exception as e:
+        logging.error(f"Could not start Paystack payment: {e}")
+        eft = f"/pay-eft/{plan}?{urllib.parse.urlencode({'contact': contact})}"
+        return gate_page("We could not start the card payment just now. You can pay by bank transfer instead: "
+                         f"{YOUR_DOMAIN}{eft}", 503)
+    return redirect(checkout_url)
+
+
 @app.route("/pay-card/<plan>")
 def pay_card(plan):
     contact = normalize_contact(request.args.get("contact"))
@@ -710,22 +748,7 @@ def pay_card(plan):
         return redirect(f"/pay-eft/{plan}?{urllib.parse.urlencode({'contact': contact})}")
     if not email or "@" not in email:
         return redirect("/subscribe?error=2")
-
-    amount = expected_amount_for_plan(plan)
-    reference = f"SIG-{secrets.token_hex(8)}"
-    create_card_payment(reference, contact, email, plan, amount, ref_code)
-    try:
-        checkout_url = initialize_transaction(
-            email=email, amount_rand=amount, reference=reference,
-            callback_url=f"{YOUR_DOMAIN}/paystack/return",
-            metadata={"whatsapp": contact, "plan": plan},
-        )
-    except Exception as e:
-        logging.error(f"Could not start Paystack payment: {e}")
-        eft = f"/pay-eft/{plan}?{urllib.parse.urlencode({'contact': contact})}"
-        return gate_page("We could not start the card payment just now. You can pay by bank transfer instead: "
-                         f"{YOUR_DOMAIN}{eft}", 503)
-    return redirect(checkout_url)
+    return start_card_checkout(contact, email, plan, ref_code, flow="link")
 
 
 @app.route("/paystack/return")
@@ -733,6 +756,15 @@ def paystack_return():
     """Where Paystack sends the customer after paying. We re-check with Paystack before giving access."""
     reference = request.args.get("reference") or request.args.get("trxref")
     status, token, expires_at = fulfil_card_payment(reference)
+    if status == "ok":
+        rec = get_card_payment(reference)
+        if rec and rec.get("flow") == "web":
+            # Subscriber-website buyer: sign them in straight away. This works ONCE per payment, so the
+            # return URL can't be passed around as a login - after that they sign in with their email.
+            if claim_web_session(reference):
+                session.permanent = True
+                session["sid"] = create_member_session(rec["contact"], members.MAX_DEVICES)
+            return redirect("/signals" if session.get("sid") else "/login")
     head = '<html><head><meta name="viewport" content="width=device-width, initial-scale=1">'
     if status == "ok":
         link = f"{YOUR_DOMAIN}/join/{token}"
@@ -809,6 +841,9 @@ def admin_members():
             actions.append(f"<a href='{escape(send)}'><b>Send link</b></a>")
         if wa:
             actions.append(f"<a href='{escape(wa)}'>Remind</a>")
+        if not is_phone(m["email"]):
+            q = urllib.parse.urlencode({"contact": m["email"], "secret": secret})
+            actions.append(f"<a href='/admin/login-link?{escape(q)}'>Sign-in link</a>")
         remind = " | ".join(actions) if actions else "-"
         rows_html += (
             f"<tr><td>{escape(m['email'])}</td><td>{escape(plan)}</td>"
@@ -886,6 +921,20 @@ def thank_you():
 @app.route("/cancelled")
 def cancelled():
     return "Payment cancelled."
+
+
+members.register(app, {
+    "normalize_contact": normalize_contact,
+    "sast": sast,
+    "domain": YOUR_DOMAIN,
+    "page_style": PAGE_STYLE,
+    "button_style": BUTTON_STYLE,
+    "paystack_enabled": paystack_enabled,
+    "start_card_checkout": start_card_checkout,
+    "daily_price": DAILY_PRICE,
+    "monthly_price": MONTHLY_PRICE,
+    "admin_secret": ADMIN_SECRET,
+})
 
 
 if __name__ == "__main__":
