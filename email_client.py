@@ -76,3 +76,45 @@ def send_invite_email(to_email: str, invite_link: str, plan: str, referral_link:
         raise RuntimeError(f"Brevo email send failed (status {resp.status_code}): {detail}")
 
     return resp.json()
+
+
+def send_email(to_email: str, subject: str, html_body: str):
+    """Send any email through Brevo's HTTPS API."""
+    if not BREVO_API_KEY:
+        raise RuntimeError("BREVO_API_KEY is empty or not set.")
+    if not FROM_EMAIL:
+        raise RuntimeError("FROM_EMAIL is empty or not set - set it to a verified sender address in Brevo.")
+    payload = {
+        "sender": {"name": FROM_NAME, "email": FROM_EMAIL},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_body,
+    }
+    headers = {"accept": "application/json", "api-key": BREVO_API_KEY, "content-type": "application/json"}
+    resp = requests.post(BREVO_SEND_URL, json=payload, headers=headers, timeout=15)
+    if not resp.ok:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Brevo email send failed (status {resp.status_code}): {detail}")
+    return resp.json()
+
+
+def send_login_email(to_email: str, link: str, valid_for: str = "20 minutes", welcome: bool = False):
+    """The email with a one-tap sign-in link for the subscriber website."""
+    if welcome:
+        subject = "Your signals access is active"
+        intro = "<p>Thank you - your access is active.</p>"
+    else:
+        subject = "Your sign-in link"
+        intro = "<p>Here is your sign-in link.</p>"
+    html = (
+        f"{intro}"
+        f"<p><a href='{link}' style='display:inline-block;padding:12px 18px;background:#0a7d3b;color:#fff;"
+        f"text-decoration:none;border-radius:6px;'>Sign in to your signals</a></p>"
+        f"<p style='word-break:break-all;color:#666;font-size:0.9em;'>{link}</p>"
+        f"<p style='color:#666;font-size:0.9em;'>This link works once and is valid for {valid_for}. "
+        f"If you did not ask for it, you can ignore this email.</p>"
+    )
+    return send_email(to_email, subject, html)
