@@ -44,7 +44,9 @@ def init_db():
     )
     # Safe migration: adds the 'amount' column if the table already existed
     # without it (e.g. persistent storage from before this change).
-    for ddl in ("ALTER TABLE subscribers ADD COLUMN amount REAL",
+    for ddl in ("ALTER TABLE card_payments ADD COLUMN flow TEXT DEFAULT 'link'",
+                "ALTER TABLE card_payments ADD COLUMN session_issued INTEGER DEFAULT 0",
+                "ALTER TABLE subscribers ADD COLUMN amount REAL",
                 "ALTER TABLE subscribers ADD COLUMN invite_link TEXT",
                 "ALTER TABLE subscribers ADD COLUMN access_token TEXT",
                 "ALTER TABLE subscribers ADD COLUMN redeemed_at TEXT"):
@@ -80,7 +82,32 @@ def init_db():
             status TEXT DEFAULT 'pending',   -- 'pending' until Paystack confirms, then 'paid'
             access_token TEXT,               -- the personal /join/<token> created for this payment
             created_at TEXT,
-            paid_at TEXT
+            paid_at TEXT,
+            flow TEXT DEFAULT 'link',        -- 'link' = WhatsApp/Telegram, 'web' = subscriber website
+            session_issued INTEGER DEFAULT 0 -- the automatic first sign-in after paying can be used once
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS login_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT UNIQUE,
+            email TEXT,
+            created_at TEXT,
+            expires_at TEXT,
+            used_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS member_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sid_hash TEXT UNIQUE,
+            email TEXT,
+            created_at TEXT,
+            last_seen TEXT
         )
         """
     )
@@ -497,12 +524,12 @@ def mark_requests_approved(contact: str):
 
 # --- Card payments (Paystack) ------------------------------------------------
 
-def create_card_payment(reference: str, contact: str, email: str, plan: str, amount: float, ref_code):
+def create_card_payment(reference: str, contact: str, email: str, plan: str, amount: float, ref_code, flow: str = "link"):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO card_payments (reference, contact, email, plan, amount, ref_code, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-        (reference, contact, email, plan, amount, ref_code, datetime.utcnow().isoformat()),
+        "INSERT INTO card_payments (reference, contact, email, plan, amount, ref_code, status, created_at, flow) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+        (reference, contact, email, plan, amount, ref_code, datetime.utcnow().isoformat(), flow),
     )
     conn.commit()
     conn.close()
@@ -541,3 +568,145 @@ def set_card_payment_token(reference: str, token: str):
     conn.execute("UPDATE card_payments SET access_token = ? WHERE reference = ?", (token, reference))
     conn.commit()
     conn.close()
+
+
+def claim_web_session(reference: str) -> bool:
+    """The automatic first sign-in after paying works ONCE per payment (so the return URL can't be shared as a login)."""
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE card_payments SET session_issued = 1 WHERE reference = ? AND COALESCE(session_issued, 0) = 0",
+        (reference,),
+    )
+    conn.commit()
+    ok = cur.rowcount == 1
+    conn.close()
+    return ok
+
+
+# --- Subscriber website: sign-in links, sessions, dashboard data -------------
+
+def _hash(raw: str) -> str:
+    import hashlib
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def member_exists(email: str) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM subscribers WHERE email = ? LIMIT 1", (email,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_member_access(email: str) -> dict | None:
+    """Everything the dashboard needs about one person (None if they've never paid)."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT MAX(expires_at) AS expires_at, MAX(telegram_user_id) AS telegram_user_id, "
+        "(SELECT plan FROM subscribers x WHERE x.email = ? ORDER BY x.id DESC LIMIT 1) AS plan, "
+        "(SELECT access_token FROM subscribers x WHERE x.email = ? ORDER BY x.id DESC LIMIT 1) AS latest_token, "
+        "(SELECT redeemed_at FROM subscribers x WHERE x.email = ? ORDER BY x.id DESC LIMIT 1) AS latest_redeemed "
+        "FROM subscribers WHERE email = ?",
+        (email, email, email, email),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row and row["expires_at"] else None
+
+
+def create_login_token(email: str, minutes: int = 20) -> str:
+    """One-time sign-in link token. Only a hash is stored."""
+    raw = secrets.token_urlsafe(24)
+    now = datetime.utcnow()
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO login_tokens (token_hash, email, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        (_hash(raw), email, now.isoformat(), (now + timedelta(minutes=minutes)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return raw
+
+
+def login_token_valid(raw: str) -> bool:
+    """Look without using it (the sign-in page asks for a tap first, so email scanners can't burn the link)."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM login_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+        (_hash(raw), datetime.utcnow().isoformat()),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def consume_login_token(raw: str) -> str | None:
+    """Use the token. Returns the email, or None if it's unknown, expired or already used."""
+    conn = get_conn()
+    now = datetime.utcnow().isoformat()
+    cur = conn.execute(
+        "UPDATE login_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+        (now, _hash(raw), now),
+    )
+    conn.commit()
+    email = None
+    if cur.rowcount == 1:
+        email = conn.execute("SELECT email FROM login_tokens WHERE token_hash = ?", (_hash(raw),)).fetchone()["email"]
+    conn.close()
+    return email
+
+
+def recent_login_token_count(email: str, minutes: int = 10) -> int:
+    conn = get_conn()
+    cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+    n = conn.execute("SELECT COUNT(*) AS c FROM login_tokens WHERE email = ? AND created_at >= ?", (email, cutoff)).fetchone()["c"]
+    conn.close()
+    return n
+
+
+def create_member_session(email: str, max_devices: int = 2) -> str:
+    """Sign someone in. A login works on at most `max_devices` devices - a newer one signs the oldest out."""
+    raw = secrets.token_urlsafe(24)
+    now = datetime.utcnow().isoformat()
+    conn = get_conn()
+    conn.execute("INSERT INTO member_sessions (sid_hash, email, created_at, last_seen) VALUES (?, ?, ?, ?)",
+                 (_hash(raw), email, now, now))
+    conn.execute(
+        "DELETE FROM member_sessions WHERE email = ? AND id NOT IN "
+        "(SELECT id FROM member_sessions WHERE email = ? ORDER BY id DESC LIMIT ?)",
+        (email, email, max_devices),
+    )
+    conn.commit()
+    conn.close()
+    return raw
+
+
+def get_member_session(raw: str, max_age_days: int = 30) -> str | None:
+    conn = get_conn()
+    row = conn.execute("SELECT email, created_at FROM member_sessions WHERE sid_hash = ?", (_hash(raw),)).fetchone()
+    if not row:
+        conn.close()
+        return None
+    if datetime.fromisoformat(row["created_at"]) < datetime.utcnow() - timedelta(days=max_age_days):
+        conn.execute("DELETE FROM member_sessions WHERE sid_hash = ?", (_hash(raw),))
+        conn.commit()
+        conn.close()
+        return None
+    conn.execute("UPDATE member_sessions SET last_seen = ? WHERE sid_hash = ?", (datetime.utcnow().isoformat(), _hash(raw)))
+    conn.commit()
+    conn.close()
+    return row["email"]
+
+
+def delete_member_session(raw: str):
+    conn = get_conn()
+    conn.execute("DELETE FROM member_sessions WHERE sid_hash = ?", (_hash(raw),))
+    conn.commit()
+    conn.close()
+
+
+def get_dashboard_signals(open_limit: int = 10, closed_limit: int = 10) -> dict:
+    conn = get_conn()
+    open_rows = conn.execute(
+        "SELECT * FROM signals WHERE outcome = 'open' ORDER BY posted_at DESC LIMIT ?", (open_limit,)).fetchall()
+    closed_rows = conn.execute(
+        "SELECT * FROM signals WHERE outcome IN ('win', 'loss') ORDER BY closed_at DESC LIMIT ?", (closed_limit,)).fetchall()
+    conn.close()
+    return {"open": [dict(r) for r in open_rows], "closed": [dict(r) for r in closed_rows]}
