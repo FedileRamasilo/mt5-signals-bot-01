@@ -127,7 +127,7 @@ tested - the two can run side by side, so you don't have to pick just one.
 Every subscriber gets a personal referral link (included in their welcome
 email, and available anytime at `/my-referrals?email=them@example.com`).
 When someone signs up through that link, the referrer automatically gets a
-free bonus day added to their subscription â€” no manual work needed, it's
+free bonus day added to their subscription — no manual work needed, it's
 handled in `add_or_extend_subscription()` in `db.py`.
 
 Referral links look like:
@@ -141,7 +141,7 @@ add your bot as admin, and put its ID in `TELEGRAM_FREE_CHANNEL_ID`.
 Once a day, the scheduler automatically posts one real, triggered signal
 (the same quality as what paid subscribers get) to this public channel with
 a link to subscribe. This lets people see genuine signal quality before
-paying â€” the single biggest trust-builder in a market full of anonymous,
+paying — the single biggest trust-builder in a market full of anonymous,
 unverifiable signal channels.
 
 ## How it works
@@ -183,7 +183,7 @@ unverifiable signal channels.
    python app.py
    ```
    Deploy this somewhere with a public HTTPS URL (Railway, Render, Fly.io,
-   or a VPS behind Nginx/Caddy with Let's Encrypt) â€” PayFast's notify_url
+   or a VPS behind Nginx/Caddy with Let's Encrypt) — PayFast's notify_url
    must be publicly reachable.
 
 6. **Run the scheduler** (separate process, can run on the same server)
@@ -203,7 +203,7 @@ unverifiable signal channels.
 4. Complete a test payment on PayFast's sandbox checkout (it uses fake card
    details, listed on PayFast's sandbox page)
 5. Check your Railway logs (or terminal) for `Subscriber ... paid for daily.
-   Invite emailed.` â€” and check your inbox for the email
+   Invite emailed.` — and check your inbox for the email
 6. Confirm the invite link actually adds you to the Telegram channel
 7. Once this full loop works, switch `PAYFAST_MODE=live` and swap in your
    real merchant ID/key
@@ -226,20 +226,20 @@ unverifiable signal channels.
   Railway's outbound IPs aren't fixed - the three checks above cover the
   practical risk.)
 - **Strategy validation**: the EMA/RSI crossover in `signal_engine.py` is a
-  starting template, not a backtested edge â€” paper trade it for a couple of
+  starting template, not a backtested edge — paper trade it for a couple of
   weeks against your own judgment before charging people for it.
 - **Compliance**: charging for trading signals in South Africa may fall
-  under FSCA/FAIS regulation â€” get a compliance opinion before scaling past
+  under FSCA/FAIS regulation — get a compliance opinion before scaling past
   a handful of users.
 - **Refund/cancellation flow**: daily subscribers who don't renew should
   just lapse naturally (handled), but you'll want a clear cancellation path
   for monthly subscribers.
 
 ## File overview
-- `price_feed.py` â€” pulls live candles from TwelveData
-- `signal_engine.py` â€” EMA/RSI strategy, generates BUY/SELL/SL/TP
-- `telegram_client.py` â€” posts signals, manages channel invites/removals
-- `email_client.py` â€” emails the invite link to a subscriber after payment
-- `db.py` â€” SQLite subscriber tracking
-- `app.py` â€” Flask server: payment links + PayFast webhook
-- `scheduler.py` â€” background job: checks signals + prunes expired access
+- `price_feed.py` — pulls live candles from TwelveData
+- `signal_engine.py` — EMA/RSI strategy, generates BUY/SELL/SL/TP
+- `telegram_client.py` — posts signals, manages channel invites/removals
+- `email_client.py` — emails the invite link to a subscriber after payment
+- `db.py` — SQLite subscriber tracking
+- `app.py` — Flask server: payment links + PayFast webhook
+- `scheduler.py` — background job: checks signals + prunes expired access

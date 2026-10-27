@@ -65,5 +65,5 @@ def fetch_all(interval: str = "15min", outputsize: int = 100) -> dict:
 if __name__ == "__main__":
     # Quick manual test - run `python price_feed.py` after setting TWELVEDATA_API_KEY
     for key, df in fetch_all().items():
-        print(f"\n{key} â€” last 3 candles:")
+        print(f"\n{key} — last 3 candles:")
         print(df.tail(3)[["datetime", "open", "high", "low", "close"]])

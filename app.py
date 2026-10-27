@@ -48,6 +48,7 @@ from db import (
     create_login_token,
     create_member_session,
 )
+import db
 import members
 from email_client import send_login_email
 from paystack_client import (
@@ -855,6 +856,7 @@ def admin_members():
     <html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
     <body style="font-family: sans-serif; max-width: 820px; margin: 30px auto; line-height: 1.5; padding: 0 12px;">
         <h2>Members</h2>
+        {('<p style="background:#fde8e8; color:#a00; padding:10px; font-weight:bold;">WARNING: ' + escape(db.storage_warning) + '</p>') if db.storage_warning else ''}
         <p style="background:#f3f3f3; padding:10px;">
         Background jobs started: {fmt(st.get('started'))}<br>
         Last signal check: {fmt(st.get('last_signal_check'))}<br>

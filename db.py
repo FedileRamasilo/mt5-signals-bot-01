@@ -6,13 +6,37 @@ friend earns the referrer a free bonus day).
 """
 
 import os
+import logging
 import sqlite3
 import secrets
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
-DB_PATH = os.getenv("DATABASE_PATH", "subscribers.db")
+
+# If the database location can't be used (for example DATABASE_PATH points at /data but the Railway
+# Volume isn't attached yet), don't crash the whole site: fall back to a temporary file and show a loud
+# warning on /admin/members. A temporary file is WIPED on every redeploy, so attach the Volume.
+storage_warning = None
+
+
+def _resolve_db_path() -> str:
+    global storage_warning
+    path = os.getenv("DATABASE_PATH", "subscribers.db")
+    try:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        sqlite3.connect(path).close()
+        return path
+    except Exception as e:
+        storage_warning = (f"Could not use DATABASE_PATH={path} ({e}). Running on a TEMPORARY database that is "
+                           f"wiped on every redeploy. Attach a Railway Volume at /data to keep your records.")
+        logging.error(storage_warning)
+        return "subscribers.db"
+
+
+DB_PATH = _resolve_db_path()
 
 
 def get_conn():
