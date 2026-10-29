@@ -89,6 +89,16 @@ MONTHLY_PRICE = os.getenv("MONTHLY_PRICE", "1500")
 
 YOUR_DOMAIN = os.getenv("PUBLIC_DOMAIN", "https://your-domain.example.com")
 
+
+def domain_ok():
+    """False when PUBLIC_DOMAIN is missing - every link we send would then point to a dead placeholder address."""
+    return YOUR_DOMAIN.startswith("https://") and "example.com" not in YOUR_DOMAIN and "your-domain" not in YOUR_DOMAIN
+
+
+DOMAIN_PROBLEM = ("PUBLIC_DOMAIN is not set in Railway, so links sent to customers would point to a dead address. "
+                  "In Railway > your web service > Variables add PUBLIC_DOMAIN=https://your-real-address "
+                  "(no slash at the end), then redeploy.")
+
 # --- Manual EFT (bank transfer) fallback, for launching before PayFast is fully wired up ---
 BANK_NAME = os.getenv("BANK_NAME", "Your Bank")
 BANK_ACCOUNT_HOLDER = os.getenv("BANK_ACCOUNT_HOLDER", "Your Name")
@@ -338,6 +348,8 @@ def admin_approve():
     if not ADMIN_SECRET or secret != ADMIN_SECRET:
         return "Not authorized - check your ADMIN_SECRET.", 403
 
+    if not domain_ok():
+        return f"<pre>{escape(DOMAIN_PROBLEM)}\n\nNothing was approved.</pre>", 503
     contact = normalize_contact(request.args.get("contact") or request.args.get("email"))
     plan = request.args.get("plan", "daily")
     ref_code = request.args.get("ref") or None
@@ -719,6 +731,9 @@ def fulfil_card_payment(reference):
 
 def start_card_checkout(contact, email, plan, ref_code, flow="link"):
     """Create the payment record, send the customer to Paystack's checkout page."""
+    if not domain_ok():
+        logging.error(DOMAIN_PROBLEM)
+        return gate_page("Card payment is temporarily unavailable. Please pay by bank transfer instead.", 503)
     amount = expected_amount_for_plan(plan)
     reference = f"SIG-{secrets.token_hex(8)}"
     create_card_payment(reference, contact, email, plan, amount, ref_code, flow)
@@ -857,6 +872,7 @@ def admin_members():
     <body style="font-family: sans-serif; max-width: 820px; margin: 30px auto; line-height: 1.5; padding: 0 12px;">
         <h2>Members</h2>
         {('<p style="background:#fde8e8; color:#a00; padding:10px; font-weight:bold;">WARNING: ' + escape(db.storage_warning) + '</p>') if db.storage_warning else ''}
+        {('<p style="background:#fde8e8; color:#a00; padding:10px; font-weight:bold;">WARNING: ' + escape(DOMAIN_PROBLEM) + '</p>') if not domain_ok() else ''}
         <p style="background:#f3f3f3; padding:10px;">
         Background jobs started: {fmt(st.get('started'))}<br>
         Last signal check: {fmt(st.get('last_signal_check'))}<br>
@@ -936,6 +952,7 @@ members.register(app, {
     "daily_price": DAILY_PRICE,
     "monthly_price": MONTHLY_PRICE,
     "admin_secret": ADMIN_SECRET,
+    "domain_ok": domain_ok,
 })
 
 
