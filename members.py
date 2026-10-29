@@ -126,7 +126,9 @@ def register(app, h):
                 note = '<p style="color:#c00;">Please enter a valid email address.</p>'
             else:
                 # Same reply whether or not the email has an account, so nobody can use this to look people up.
-                if db.member_exists(email) and db.recent_login_token_count(email, 10) < 3:
+                if not h["domain_ok"]():
+                    logging.error("Sign-in email not sent: PUBLIC_DOMAIN is not set in Railway.")
+                elif db.member_exists(email) and db.recent_login_token_count(email, 10) < 3:
                     token = db.create_login_token(email, minutes=20)
                     try:
                         send_login_email(email, f"{domain}/login/{token}")
