@@ -7,6 +7,7 @@ subscribers based on payment status.
 import os
 import time
 import requests
+import instruments
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,12 +17,7 @@ CHANNEL_ID = os.getenv("TELEGRAM_SIGNAL_CHANNEL_ID")
 FREE_CHANNEL_ID = os.getenv("TELEGRAM_FREE_CHANNEL_ID")  # public channel for the daily proof signal
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-DISPLAY_NAMES = {
-    "BTC": "Bitcoin (BTC/USD)",
-    "USDCHF": "USD/CHF",
-    "GOLD": "Gold (XAU/USD)",
-    "USDZAR": "USD/ZAR",
-}
+DISPLAY_NAMES = {key: info["name"] for key, info in instruments.ALL.items()}
 
 
 def format_signal_message(signal: dict) -> str:
@@ -67,7 +63,7 @@ def format_free_signal_message(signal: dict, subscribe_link: str) -> str:
         f"Stop Loss: `{signal['sl']}`\n"
         f"Take Profit: `{signal['tp']}`\n\n"
         f"This is one of several signals we send paid subscribers daily across "
-        f"BTC, USD/CHF, Gold, and USD/ZAR.\n"
+        f"{instruments.market_list_text()}.\n"
         f"Subscribe for the full daily feed: {subscribe_link}\n\n"
         f"_Not financial advice. Trade your own risk management._"
     )
